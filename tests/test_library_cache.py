@@ -994,3 +994,60 @@ class TestSpendLedger:
             raise RuntimeError("disk gone")
         monkeypatch.setattr(library_cache, "ensure_db_initialized", boom)
         library_cache.record_cost("m", "generation", 1, 1, 1.0)  # must not raise
+
+class TestExtendResultPersistence:
+    """Extend Library runs are stored so closing the tab does not discard a
+    result that cost real money, and so the same question is not paid for twice.
+    """
+
+    @staticmethod
+    def _save(source_id, n_albums=2, title="My Playlist"):
+        return library_cache.save_result(
+            result_type=library_cache.EXTEND_RESULT_TYPE,
+            title=f"Missing albums for {title}",
+            prompt="moody prog",
+            snapshot={
+                "albums": [
+                    {"artist": f"Band {i}", "album": f"Record {i}"} for i in range(n_albums)
+                ],
+                "source_result_id": source_id,
+                "source_title": title,
+                "rounds": 2,
+                "cost": 0.5,
+            },
+            track_count=n_albums,
+            subtitle=f"{n_albums} albums you do not own",
+        )
+
+    def test_a_saved_run_is_found_by_its_source_playlist(self, initialized_db):
+        self._save("playlist-1", n_albums=3)
+        found = library_cache.get_latest_extend_for_playlist("playlist-1")
+        assert found is not None
+        assert found["track_count"] == 3
+        assert found["snapshot"]["source_result_id"] == "playlist-1"
+        assert len(found["snapshot"]["albums"]) == 3
+
+    def test_a_playlist_with_no_run_returns_none(self, initialized_db):
+        self._save("playlist-1")
+        assert library_cache.get_latest_extend_for_playlist("playlist-2") is None
+
+    def test_the_latest_run_wins(self, initialized_db):
+        old_id = self._save("playlist-1", n_albums=2)
+        conn = library_cache.ensure_db_initialized()
+        conn.execute("UPDATE results SET created_at = datetime('now', '-2 days') WHERE id = ?", (old_id,))
+        conn.commit()
+        new_id = self._save("playlist-1", n_albums=7)
+        found = library_cache.get_latest_extend_for_playlist("playlist-1")
+        assert found["id"] == new_id
+        assert found["track_count"] == 7
+
+    def test_playlists_are_not_mistaken_for_extend_runs(self, initialized_db):
+        """The results table is shared, so the type filter has to hold."""
+        library_cache.save_result(
+            result_type="prompt_playlist", title="A Playlist", prompt="p",
+            snapshot={"tracks": [], "source_result_id": "playlist-1"},
+            track_count=0,
+        )
+        assert library_cache.get_latest_extend_for_playlist("playlist-1") is None, (
+            "a playlist that happens to carry the same key must not match"
+        )

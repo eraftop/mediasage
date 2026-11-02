@@ -1741,6 +1741,30 @@ async def recommend_generate(request: RecommendGenerateRequest, raw_request: Req
 _VALID_RESULT_TYPES = {"prompt_playlist", "seed_playlist", "album_recommendation"}
 
 
+@app.get("/api/extend/latest/{source_result_id}")
+async def get_latest_extend(source_result_id: str) -> dict:
+    """The most recent Extend Library run for a given playlist, if any.
+
+    Lets the view offer a previous result instead of silently charging for the
+    same question twice.
+    """
+    saved = await asyncio.to_thread(
+        library_cache.get_latest_extend_for_playlist, source_result_id
+    )
+    if not saved:
+        return {"found": False}
+    snapshot = saved.get("snapshot") or {}
+    return {
+        "found": True,
+        "result_id": saved["id"],
+        "created_at": saved["created_at"],
+        "albums": snapshot.get("albums", []),
+        "rounds": snapshot.get("rounds"),
+        "cost": snapshot.get("cost"),
+        "max_albums_per_artist": snapshot.get("max_albums_per_artist"),
+    }
+
+
 @app.get("/api/spend")
 async def get_spend() -> dict:
     """What this app has spent, from its own ledger.
@@ -2064,7 +2088,36 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                     break
 
             _, cost = pipeline.get_session_costs(session_id)
-            yield f"event: complete\ndata: {json.dumps({'albums': [a.model_dump() for a in found], 'rounds': rounds, 'cost': cost})}\n\n"
+
+            # Persist it, so closing the tab does not throw away a result that
+            # cost real money to produce. Stored in the existing `results`
+            # table under its own type, with source_result_id in the snapshot so
+            # the run can be found again from the playlist it came from.
+            saved_id = None
+            albums_payload = [a.model_dump() for a in found]
+            if found:
+                try:
+                    saved_id = library_cache.save_result(
+                        result_type=library_cache.EXTEND_RESULT_TYPE,
+                        title=f"Missing albums for {result.get('title') or 'a playlist'}",
+                        prompt=result.get("prompt") or "",
+                        snapshot={
+                            "albums": albums_payload,
+                            "source_result_id": request.result_id,
+                            "source_title": result.get("title") or "",
+                            "target_albums": request.target_albums,
+                            "max_albums_per_artist": request.max_albums_per_artist,
+                            "rounds": rounds,
+                            "cost": cost,
+                        },
+                        track_count=len(found),
+                        subtitle=f"{len(found)} albums you do not own \u00b7 from {result.get('title') or 'a playlist'}",
+                    )
+                except Exception:
+                    # A result the user can see is worth more than a stored one.
+                    logger.exception("extend: saving the result failed; returning it anyway")
+
+            yield f"event: complete\ndata: {json.dumps({'albums': albums_payload, 'rounds': rounds, 'cost': cost, 'result_id': saved_id})}\n\n"
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error
             logger.exception("extend_library_sse failed")
             yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"

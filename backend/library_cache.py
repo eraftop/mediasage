@@ -1286,3 +1286,39 @@ def get_spend_summary(days: int | None = None) -> dict[str, Any]:
         "by_call_type": by_type,
         "by_model": by_model,
     }
+
+
+EXTEND_RESULT_TYPE = "extend_library"
+
+
+def get_latest_extend_for_playlist(source_result_id: str) -> dict[str, Any] | None:
+    """The most recent Extend Library run for one source playlist, or None.
+
+    Matched on source_result_id inside the snapshot rather than on a foreign
+    key, because `results` is a generic store shared by playlists and album
+    recommendations; adding a column for one result type's parent would make
+    every other row carry a null. json_extract keeps the coupling in the one
+    place that cares.
+    """
+    conn = ensure_db_initialized()
+    row = conn.execute(
+        "SELECT id, type, title, prompt, snapshot, track_count, artist, "
+        "art_rating_key, subtitle, created_at FROM results "
+        "WHERE type = ? AND json_extract(snapshot, '$.source_result_id') = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (EXTEND_RESULT_TYPE, source_result_id),
+    ).fetchone()
+    if not row:
+        return None
+    out = dict(row) if not isinstance(row, tuple) else {
+        k: row[i] for i, k in enumerate(
+            ["id", "type", "title", "prompt", "snapshot", "track_count",
+             "artist", "art_rating_key", "subtitle", "created_at"]
+        )
+    }
+    if isinstance(out.get("snapshot"), str):
+        try:
+            out["snapshot"] = json.loads(out["snapshot"])
+        except json.JSONDecodeError:
+            out["snapshot"] = {}
+    return out

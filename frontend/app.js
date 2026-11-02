@@ -100,7 +100,7 @@ const state = {
     maxTracksPerAlbum: 0,  // 0 = no cap, matching the backend default
 
     // Extend Library
-    extend: { step: 'input', targetAlbums: 10, maxPerArtist: 1, playlists: [], albums: [], busy: false },
+    extend: { step: 'input', targetAlbums: 10, maxPerArtist: 1, playlists: [], albums: [], busy: false, previous: null },
     minRating: 0,  // Plex 0-10 scale: 0 = any, 1 = half a star ... 10 = five stars
 
     // Results
@@ -5858,6 +5858,7 @@ async function loadExtendPlaylists() {
         const none = state.extend.playlists.length === 0;
         select.disabled = none;
         document.getElementById('extend-run').disabled = none;
+        if (!none) checkPreviousExtend();
         if (none && hint) {
             hint.textContent = 'No saved playlists yet. Make one first, then come back.';
         }
@@ -5975,6 +5976,18 @@ function initExtendLibrary() {
             });
         });
     });
+    document.getElementById('extend-playlist')?.addEventListener('change', checkPreviousExtend);
+    document.getElementById('extend-show-previous')?.addEventListener('click', () => {
+        const prev = state.extend.previous;
+        if (!prev) return;
+        state.extend.albums = prev.albums || [];
+        renderExtendResults(state.extend.albums, prev.rounds, prev.cost);
+        const summary = document.getElementById('extend-summary');
+        if (summary) {
+            summary.textContent = `${summary.textContent} \u00b7 saved ${prev.created_at}`;
+        }
+        setExtendStep('results');
+    });
     document.getElementById('extend-run')?.addEventListener('click', runExtend);
     document.getElementById('extend-again')?.addEventListener('click', () => {
         state.extend.albums = [];
@@ -6007,6 +6020,32 @@ async function refreshSpend() {
         if (sep) sep.hidden = false;
     } catch {
         // A missing spend line is not worth an error anywhere visible.
+    }
+}
+
+async function checkPreviousExtend() {
+    const select = document.getElementById('extend-playlist');
+    const note = document.getElementById('extend-previous');
+    const btn = document.getElementById('extend-show-previous');
+    state.extend.previous = null;
+    if (note) note.hidden = true;
+    if (btn) btn.hidden = true;
+    if (!select || !select.value) return;
+    try {
+        const res = await fetch(`/api/extend/latest/${encodeURIComponent(select.value)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.found) return;
+        state.extend.previous = data;
+        if (note) {
+            const n = (data.albums || []).length;
+            const cost = data.cost ? ` for $${data.cost.toFixed(2)}` : '';
+            note.textContent = `Already run for this playlist: ${n} album${n === 1 ? '' : 's'} on ${data.created_at}${cost}. Running again costs the same as the first time.`;
+            note.hidden = false;
+        }
+        if (btn) btn.hidden = false;
+    } catch {
+        // No previous run is the normal case; a failure here is not worth showing.
     }
 }
 

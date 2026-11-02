@@ -789,6 +789,54 @@ class TestExtendLibrary:
             f"the rejected album must be excluded next round; got {passed}"
         )
 
+
+    def test_a_completed_run_is_saved_and_its_id_returned(self, client):
+        batches = [[self._album("A", "1"), self._album("B", "2")], []]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline) + [
+            patch("backend.main.library_cache.save_result", return_value="saved1"),
+        ]
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 2, "max_albums_per_artist": 1,
+            })
+            data = self._complete(r.text)
+        assert data["result_id"] == "saved1"
+
+    def test_a_save_failure_still_returns_the_albums(self, client):
+        """A result the user can see is worth more than a stored one."""
+        batches = [[self._album("A", "1")], []]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline) + [
+            patch("backend.main.library_cache.save_result", side_effect=RuntimeError("disk full")),
+        ]
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 1})
+            data = self._complete(r.text)
+        assert len(data["albums"]) == 1
+        assert data["result_id"] is None
+
+    def test_latest_endpoint_reports_not_found_cleanly(self, client):
+        with patch("backend.main.library_cache.get_latest_extend_for_playlist", return_value=None):
+            r = client.get("/api/extend/latest/nope")
+        assert r.status_code == 200 and r.json() == {"found": False}
+
+    def test_latest_endpoint_returns_a_previous_run(self, client):
+        saved = {
+            "id": "e1", "created_at": "2026-11-02 10:00:00",
+            "snapshot": {"albums": [{"artist": "A", "album": "1"}], "rounds": 2,
+                         "cost": 0.4, "max_albums_per_artist": 1},
+        }
+        with patch("backend.main.library_cache.get_latest_extend_for_playlist", return_value=saved):
+            r = client.get("/api/extend/latest/playlist-1")
+        body = r.json()
+        assert body["found"] is True and body["result_id"] == "e1"
+        assert len(body["albums"]) == 1 and body["cost"] == 0.4
+
     def test_rejects_an_out_of_range_target(self, client):
         r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 99})
         assert r.status_code == 422
