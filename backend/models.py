@@ -740,6 +740,17 @@ class TasteProfile(BaseModel):
     owned_albums: list[dict[str, str]] = []
 
 
+class ExtendLibraryRequest(BaseModel):
+    """Request to find albums missing from the library that suit a playlist."""
+
+    result_id: str
+    # select_discovery_albums returns 1 primary + 2 secondary per call, so this
+    # is reached by looping it with previously_recommended rather than by asking
+    # for more in one call -- which would mean editing a function the existing
+    # Recommended Albums tab depends on.
+    target_albums: int = Field(10, ge=1, le=30)
+
+
 class RecommendSessionState(BaseModel):
     """Transient state maintained during a recommendation session."""
 

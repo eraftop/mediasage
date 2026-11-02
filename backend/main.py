@@ -30,7 +30,9 @@ from backend.config import (
 )
 from backend.version import get_version
 from backend.models import (
+    ExtendLibraryRequest,
     AlbumCandidate,
+    AlbumRecommendation,
     AlbumPreviewResponse,
     AnalyzePromptFiltersRequest,
     AnalyzePromptFiltersResponse,
@@ -1926,3 +1928,106 @@ async def serve_index():
         html = html.replace("/static/app.js", f"/static/app.js?v={v}")
         return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
     return {"message": "MediaSage API is running. Frontend not found."}
+
+# Albums one would want for a given playlist, that the library does not have.
+MAX_EXTEND_ROUNDS = 6
+
+
+def _playlist_extend_prompt(result: dict, tracks: list[dict]) -> str:
+    """Turn a saved playlist into a prompt for the discovery selector.
+
+    The playlist IS the specification, which is why this flow skips the
+    clarifying-question step the Recommended Albums tab uses: there is nothing
+    to ask when the user has already handed over 25 tracks they liked.
+    """
+    title = result.get("title") or "this playlist"
+    original = (result.get("prompt") or "").strip()
+    sample = "\n".join(
+        f"- {t.get('artist', '?')} - {t.get('title', '?')} ({t.get('album', '?')})"
+        for t in tracks[:25]
+    )
+    parts = [f'The user has a playlist called "{title}" that they like.']
+    if original:
+        parts.append(f"It was built from this request: {original}")
+    parts.append(
+        "Recommend albums that would fit this playlist and that they do NOT "
+        "already own, so they can extend their library towards it."
+    )
+    parts.append(f"The playlist contains:\n{sample}")
+    return "\n\n".join(parts)
+
+
+@app.post("/api/extend/stream")
+async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse:
+    """Find albums missing from the library that would suit a saved playlist."""
+    pipeline = _get_pipeline()
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="LLM not configured")
+
+    result = await asyncio.to_thread(library_cache.get_result, request.result_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    tracks = (result.get("snapshot") or {}).get("tracks") or []
+    if not tracks:
+        raise HTTPException(status_code=400, detail="That playlist has no track snapshot to learn from")
+
+    if not await asyncio.to_thread(library_cache.has_cached_tracks):
+        raise HTTPException(
+            status_code=400,
+            detail="Library cache is empty. A full library is needed to know what is missing from it.",
+        )
+
+    def event_stream():
+        try:
+            candidates_raw = library_cache.get_album_candidates()
+            library_candidates = [AlbumCandidate(**c) for c in candidates_raw]
+            profile = pipeline.build_playlist_taste_profile(tracks, library_candidates)
+            prompt = _playlist_extend_prompt(result, tracks)
+            session_id = pipeline.create_session(
+                RecommendSessionState(mode="discovery", prompt=prompt, taste_profile=profile)
+            )
+
+            found: list[AlbumRecommendation] = []
+            seen: set[str] = set()
+            rounds = 0
+            while len(found) < request.target_albums and rounds < MAX_EXTEND_ROUNDS:
+                rounds += 1
+                yield f"event: progress\ndata: {json.dumps({'step': 'selecting', 'message': f'Looking for albums ({len(found)} of {request.target_albums} so far)...'})}\n\n"
+                batch = pipeline.select_discovery_albums(
+                    prompt=prompt,
+                    answers=[],
+                    answer_texts=[],
+                    taste_profile=profile,
+                    session_id=session_id,
+                    previously_recommended=sorted(seen) or None,
+                )
+                added = 0
+                for album in batch:
+                    key = f"{album.artist}|||{album.album}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    found.append(album)
+                    added += 1
+                    if len(found) >= request.target_albums:
+                        break
+                pipeline.update_previously_recommended(session_id, sorted(seen))
+                if added == 0:
+                    # The model has stopped producing anything new; stop paying
+                    # for rounds that repeat themselves.
+                    logger.info("extend: round %d added nothing new, stopping", rounds)
+                    break
+
+            _, cost = pipeline.get_session_costs(session_id)
+            yield f"event: complete\ndata: {json.dumps({'albums': [a.model_dump() for a in found], 'rounds': rounds, 'cost': cost})}\n\n"
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error
+            logger.exception("extend_library_sse failed")
+            yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+

@@ -715,3 +715,98 @@ class TestSessionLifecycle:
         tokens, cost = pipeline.get_session_costs(sid)
         assert tokens == 0
         assert cost == 0.0
+
+class TestPlaylistTasteProfile:
+    """Tests for build_playlist_taste_profile, which powers "Extend Library".
+
+    The shape that matters: the taste SIGNAL comes from the playlist, while
+    owned_albums stays the WHOLE library. Mixing those up is the only way this
+    can go quietly wrong -- a profile built from the playlist alone would let
+    the model recommend albums the user already owns, because the exclusion list
+    would only cover the 25 tracks in the playlist.
+    """
+
+    @staticmethod
+    def _library():
+        from backend.models import AlbumCandidate
+        return [
+            AlbumCandidate(
+                parent_rating_key="p1", album="Atom Heart Mother",
+                album_artist="Pink Floyd", year=1970, genres=["Prog Rock"],
+                decade="1970s", track_count=5,
+            ),
+            AlbumCandidate(
+                parent_rating_key="p2", album="Resonance",
+                album_artist="Anathema", year=2001, genres=["Doom Metal", "Prog Rock"],
+                decade="2000s", track_count=8,
+            ),
+            AlbumCandidate(
+                parent_rating_key="p3", album="Random Pop Record",
+                album_artist="Someone Else", year=1985, genres=["Pop"],
+                decade="1980s", track_count=10,
+            ),
+        ]
+
+    @staticmethod
+    def _playlist_tracks():
+        # Two albums from the library; the pop record is deliberately absent.
+        return [
+            {"artist": "Pink Floyd", "album": "Atom Heart Mother", "title": "A"},
+            {"artist": "Pink Floyd", "album": "Atom Heart Mother", "title": "B"},
+            {"artist": "Anathema", "album": "Resonance", "title": "C"},
+        ]
+
+    def _profile(self):
+        from backend.recommender import RecommendationPipeline
+        from unittest.mock import MagicMock
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=MagicMock())
+        return pipeline.build_playlist_taste_profile(
+            self._playlist_tracks(), self._library()
+        )
+
+    def test_genres_come_from_the_playlist_not_the_library(self):
+        profile = self._profile()
+        assert "Pop" not in profile.genre_distribution, (
+            "Pop is in the library but not in the playlist; it must not shape the taste signal"
+        )
+        assert profile.genre_distribution.get("Prog Rock", 0) > 0
+
+    def test_decades_come_from_the_playlist(self):
+        profile = self._profile()
+        assert set(profile.decade_distribution) == {"1970s", "2000s"}
+
+    def test_top_artists_come_from_the_playlist_most_played_first(self):
+        profile = self._profile()
+        assert profile.top_artists[0] == "Pink Floyd", profile.top_artists
+
+    def test_owned_albums_covers_the_WHOLE_library(self):
+        """The exclusion list must not shrink to the playlist."""
+        profile = self._profile()
+        owned = {(o["artist"], o["album"]) for o in profile.owned_albums}
+        assert ("Someone Else", "Random Pop Record") in owned, (
+            "an album absent from the playlist is still owned and must be excluded"
+        )
+        assert len(profile.owned_albums) == 3
+        assert profile.total_albums == 3
+
+    def test_playlist_tracks_not_in_the_library_are_ignored_gracefully(self):
+        from backend.recommender import RecommendationPipeline
+        from unittest.mock import MagicMock
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=MagicMock())
+        tracks = self._playlist_tracks() + [
+            {"artist": "Ghost Band", "album": "Not In Library", "title": "X"}
+        ]
+        profile = pipeline.build_playlist_taste_profile(tracks, self._library())
+        # Contributes an artist count but no genre/decade, since there is no
+        # library album to read them from.
+        assert "Ghost Band" in profile.top_artists
+        assert set(profile.decade_distribution) == {"1970s", "2000s"}
+
+    def test_empty_playlist_yields_an_empty_signal_but_full_exclusions(self):
+        from backend.recommender import RecommendationPipeline
+        from unittest.mock import MagicMock
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=MagicMock())
+        profile = pipeline.build_playlist_taste_profile([], self._library())
+        assert profile.genre_distribution == {}
+        assert len(profile.owned_albums) == 3
+

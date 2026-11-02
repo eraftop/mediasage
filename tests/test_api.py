@@ -1,6 +1,7 @@
 """Tests for API endpoints."""
 
 import pytest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -563,4 +564,139 @@ class TestAlbumCapWiring:
         r = client.post("/api/generate/stream", json={
             "prompt": "rock", "genres": [], "decades": [], "max_tracks_per_album": -1,
         })
+        assert r.status_code == 422
+
+class TestExtendLibrary:
+    """Tests for /api/extend/stream -- "which albums am I missing for this playlist".
+
+    The loop is the new logic and the part that can quietly misbehave: it calls
+    select_discovery_albums repeatedly (3 albums per call) until the target is
+    met, and must deduplicate across rounds and stop paying for rounds that
+    repeat themselves.
+    """
+
+    @staticmethod
+    def _album(artist, album):
+        from backend.models import AlbumRecommendation
+        return AlbumRecommendation(rank="secondary", album=album, artist=artist)
+
+    @staticmethod
+    def _result(tracks=None):
+        return {
+            "id": "r1", "type": "prompt_playlist", "title": "Test Playlist",
+            "prompt": "moody prog", "track_count": 2,
+            "snapshot": {"tracks": tracks if tracks is not None else [
+                {"artist": "Pink Floyd", "album": "Atom Heart Mother", "title": "A"},
+            ]},
+        }
+
+    def _patches(self, pipeline, result=None, has_cache=True):
+        return [
+            patch("backend.main._get_pipeline", return_value=pipeline),
+            patch("backend.main.library_cache.get_result",
+                  return_value=self._result() if result is None else result),
+            patch("backend.main.library_cache.has_cached_tracks", return_value=has_cache),
+            patch("backend.main.library_cache.get_album_candidates", return_value=[]),
+        ]
+
+    def _pipeline(self, batches):
+        """A pipeline whose selector returns each batch in turn."""
+        pipeline = MagicMock()
+        pipeline.create_session.return_value = "s1"
+        pipeline.select_discovery_albums.side_effect = batches
+        pipeline.get_session_costs.return_value = (0, 0.0)
+        # A real TasteProfile, not a MagicMock: the route stores it on a
+        # RecommendSessionState, and pydantic rejects a mock there.
+        from backend.models import TasteProfile
+        pipeline.build_playlist_taste_profile.return_value = TasteProfile()
+        return pipeline
+
+    @staticmethod
+    def _complete(body):
+        """Pull the `complete` event payload out of an SSE body."""
+        import json as _json
+        for chunk in body.split("\n\n"):
+            if "event: complete" in chunk:
+                for line in chunk.split("\n"):
+                    if line.startswith("data: "):
+                        return _json.loads(line[6:])
+        return None
+
+    def test_unknown_playlist_is_404(self, client):
+        pipeline = self._pipeline([[]])
+        with patch("backend.main._get_pipeline", return_value=pipeline), \
+             patch("backend.main.library_cache.get_result", return_value=None):
+            r = client.post("/api/extend/stream", json={"result_id": "nope"})
+        assert r.status_code == 404
+
+    def test_playlist_without_a_snapshot_is_400(self, client):
+        pipeline = self._pipeline([[]])
+        with patch("backend.main._get_pipeline", return_value=pipeline), \
+             patch("backend.main.library_cache.get_result", return_value=self._result(tracks=[])):
+            r = client.post("/api/extend/stream", json={"result_id": "r1"})
+        assert r.status_code == 400
+
+    def test_empty_library_is_400(self, client):
+        """Knowing what is MISSING requires knowing what is there."""
+        pipeline = self._pipeline([[]])
+        with patch("backend.main._get_pipeline", return_value=pipeline), \
+             patch("backend.main.library_cache.get_result", return_value=self._result()), \
+             patch("backend.main.library_cache.has_cached_tracks", return_value=False):
+            r = client.post("/api/extend/stream", json={"result_id": "r1"})
+        assert r.status_code == 400
+
+    def test_loops_until_the_target_is_reached(self, client):
+        batches = [
+            [self._album("A", "1"), self._album("B", "2"), self._album("C", "3")],
+            [self._album("D", "4"), self._album("E", "5"), self._album("F", "6")],
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 6})
+            data = self._complete(r.text)
+        assert r.status_code == 200
+        assert data is not None, r.text
+        assert len(data["albums"]) == 6
+        assert data["rounds"] == 2
+
+    def test_deduplicates_across_rounds(self, client):
+        """A repeat in round 2 must not be counted twice."""
+        batches = [
+            [self._album("A", "1"), self._album("B", "2"), self._album("C", "3")],
+            [self._album("A", "1"), self._album("D", "4"), self._album("E", "5")],
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 5})
+            data = self._complete(r.text)
+        keys = [(a["artist"], a["album"]) for a in data["albums"]]
+        assert len(keys) == len(set(keys)), f"duplicates got through: {keys}"
+        assert len(keys) == 5
+
+    def test_stops_early_when_a_round_adds_nothing_new(self, client):
+        """Guards against paying for rounds that repeat themselves."""
+        batches = [
+            [self._album("A", "1"), self._album("B", "2"), self._album("C", "3")],
+            [self._album("A", "1"), self._album("B", "2"), self._album("C", "3")],
+            [self._album("X", "9")],  # should never be requested
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 10})
+            data = self._complete(r.text)
+        assert len(data["albums"]) == 3
+        assert data["rounds"] == 2, "should stop after the unproductive round, not keep going"
+        assert pipeline.select_discovery_albums.call_count == 2
+
+    def test_rejects_an_out_of_range_target(self, client):
+        r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 99})
         assert r.status_code == 422

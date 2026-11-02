@@ -98,6 +98,9 @@ const state = {
     excludeLive: true,
     maxTracksToAI: 500,  // 0 = no limit
     maxTracksPerAlbum: 0,  // 0 = no cap, matching the backend default
+
+    // Extend Library
+    extend: { step: 'input', targetAlbums: 10, playlists: [], albums: [], busy: false },
     minRating: 0,  // Plex 0-10 scale: 0 = any, 1 = half a star ... 10 = five stars
 
     // Results
@@ -556,6 +559,7 @@ const HASH_TO_VIEW = {
     'playlist-prompt': 'create',
     'playlist-seed': 'create',
     'recommend-album': 'recommend',
+    'extend-library': 'extend',
     'settings': 'settings',
     'result': 'result',
     // Backward compat
@@ -570,6 +574,7 @@ const VIEW_TO_HASH = {
     'home': 'home',
     'create': null,  // determined by mode
     'recommend': 'recommend-album',
+    'extend': 'extend-library',
     'settings': 'settings',
 };
 
@@ -622,6 +627,9 @@ function navigateTo(view, mode) {
         loadSettings();
     } else if (view === 'recommend') {
         initRecommendView();
+    } else if (view === 'extend') {
+        setExtendStep('input');
+        loadExtendPlaylists();
     } else if (view === 'home') {
         renderHistoryFeed();
     }
@@ -1022,6 +1030,7 @@ function updateView() {
     document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
         const hash = btn.dataset.nav;
         const isActive = (hash === 'recommend-album' && state.view === 'recommend') ||
+                         (hash === 'extend-library' && state.view === 'extend') ||
                          (hash === 'settings' && state.view === 'settings');
         btn.classList.toggle('active', isActive);
         btn.setAttribute('aria-current', isActive ? 'true' : 'false');
@@ -5778,8 +5787,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Initialize views AFTER config is loaded
+    initExtendLibrary();  // binds handlers once; cheap and view-independent
     if (state.view === 'recommend') {
         initRecommendView();
+    } else if (state.view === 'extend') {
+        setExtendStep('input');
+        loadExtendPlaylists();
     } else if (state.view === 'home') {
         renderHistoryFeed();
     }
@@ -5815,3 +5828,142 @@ window.dismissPlayChoice = dismissPlayChoice;
 window.dismissPlaySuccess = dismissPlaySuccess;
 window.dismissUpdateSuccess = dismissUpdateSuccess;
 window.closeBottomSheet = closeBottomSheet;
+
+// =============================================================================
+// Extend Library
+// =============================================================================
+
+function setExtendStep(step) {
+    state.extend.step = step;
+    ['input', 'working', 'results'].forEach(s => {
+        const el = document.getElementById(`extend-step-${s}`);
+        if (el) el.classList.toggle('active', s === step);
+    });
+}
+
+async function loadExtendPlaylists() {
+    const select = document.getElementById('extend-playlist');
+    const hint = document.getElementById('extend-playlist-hint');
+    if (!select) return;
+    try {
+        // Reuses the existing results endpoint; only playlist-type results carry
+        // the track snapshot this feature learns from.
+        const res = await fetch('/api/results?result_type=prompt_playlist,seed_playlist&limit=50');
+        const data = await res.json();
+        state.extend.playlists = data.results || [];
+        select.innerHTML = state.extend.playlists
+            .map(p => `<option value="${p.id}">${p.title} (${p.track_count} tracks)</option>`)
+            .join('');
+        const none = state.extend.playlists.length === 0;
+        select.disabled = none;
+        document.getElementById('extend-run').disabled = none;
+        if (none && hint) {
+            hint.textContent = 'No saved playlists yet. Make one first, then come back.';
+        }
+    } catch (err) {
+        if (hint) hint.textContent = `Could not load playlists: ${err.message}`;
+    }
+}
+
+function renderExtendResults(albums, rounds, cost) {
+    const summary = document.getElementById('extend-summary');
+    const list = document.getElementById('extend-results');
+    if (summary) {
+        const costText = cost ? ` \u00b7 $${cost.toFixed(4)}` : '';
+        summary.textContent = albums.length
+            ? `${albums.length} album${albums.length === 1 ? '' : 's'} you do not own, in ${rounds} round${rounds === 1 ? '' : 's'}${costText}`
+            : 'Nothing new found. Try a different playlist, or ask for fewer albums.';
+    }
+    if (list) {
+        list.innerHTML = albums.map(a => `
+            <div class="result-card">
+                <div class="result-card-body">
+                    <h4>${a.artist} \u2014 ${a.album}${a.year ? ` (${a.year})` : ''}</h4>
+                    ${a.pitch && a.pitch.hook ? `<p>${a.pitch.hook}</p>` : ''}
+                </div>
+            </div>`).join('');
+    }
+}
+
+async function runExtend() {
+    if (state.extend.busy) return;
+    const select = document.getElementById('extend-playlist');
+    const resultId = select && select.value;
+    if (!resultId) return;
+
+    state.extend.busy = true;
+    setExtendStep('working');
+    const progress = document.getElementById('extend-progress');
+    if (progress) progress.textContent = 'Reading the playlist...';
+
+    try {
+        const res = await fetch('/api/extend/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ result_id: resultId, target_albums: state.extend.targetAlbums }),
+        });
+        if (!res.ok) {
+            const detail = await res.json().catch(() => ({}));
+            throw new Error(detail.detail || `HTTP ${res.status}`);
+        }
+        // Parse SSE off the streaming body. Events are separated by a blank line.
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let done = false;
+        while (!done) {
+            const { value, done: streamDone } = await reader.read();
+            if (streamDone) break;
+            buffer += decoder.decode(value, { stream: true });
+            let split;
+            while ((split = buffer.indexOf('\n\n')) !== -1) {
+                const chunk = buffer.slice(0, split);
+                buffer = buffer.slice(split + 2);
+                let event = '';
+                let payload = null;
+                chunk.split('\n').forEach(line => {
+                    if (line.startsWith('event: ')) event = line.slice(7);
+                    else if (line.startsWith('data: ')) {
+                        try { payload = JSON.parse(line.slice(6)); } catch { /* keep going */ }
+                    }
+                });
+                if (event === 'progress' && payload && progress) {
+                    progress.textContent = payload.message || 'Working...';
+                } else if (event === 'complete' && payload) {
+                    state.extend.albums = payload.albums || [];
+                    renderExtendResults(state.extend.albums, payload.rounds, payload.cost);
+                    setExtendStep('results');
+                    done = true;
+                } else if (event === 'error' && payload) {
+                    throw new Error(payload.message || 'Unknown error');
+                }
+            }
+        }
+    } catch (err) {
+        if (progress) progress.textContent = `Failed: ${err.message}`;
+        renderExtendResults([], 0, 0);
+        setExtendStep('results');
+    } finally {
+        state.extend.busy = false;
+    }
+}
+
+function initExtendLibrary() {
+    document.querySelectorAll('.extend-count-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            state.extend.targetAlbums = parseInt(btn.dataset.extendCount);
+            document.querySelectorAll('.extend-count-btn').forEach(b => {
+                const active = b === btn;
+                b.classList.toggle('active', active);
+                b.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+        });
+    });
+    document.getElementById('extend-run')?.addEventListener('click', runExtend);
+    document.getElementById('extend-again')?.addEventListener('click', () => {
+        state.extend.albums = [];
+        setExtendStep('input');
+        loadExtendPlaylists();
+    });
+}
+

@@ -977,6 +977,63 @@ class RecommendationPipeline:
             owned_albums=owned,
         )
 
+    def build_playlist_taste_profile(
+        self,
+        playlist_tracks: list[dict],
+        library_candidates: list["AlbumCandidate"],
+    ) -> TasteProfile:
+        """Build a taste profile whose SIGNAL is one playlist but whose
+        EXCLUSIONS are the whole library.
+
+        This is what makes "Extend Library" different from discovery mode:
+        discovery asks "what suits this collection?", while this asks "what
+        suits *this playlist*, that the collection does not already have?".
+
+        The asymmetry is the whole point and the one thing to get right.
+        genre/decade/artist distributions describe the playlist, so the model
+        aims at the right sound. `owned_albums` and `total_albums` describe the
+        entire library, because they are the exclusion list -- a profile built
+        from the playlist alone would happily recommend albums the user already
+        owns, since nothing outside those 25 tracks would be excluded.
+
+        Playlist tracks whose album is not in the library still contribute an
+        artist count, but no genre or decade: there is no library album to read
+        those from, and inventing them would bias the signal.
+        """
+        genre_dist: dict[str, int] = {}
+        decade_dist: dict[str, int] = {}
+        artist_counts: dict[str, int] = {}
+
+        by_album: dict[tuple[str, str], AlbumCandidate] = {
+            (c.album_artist.strip().lower(), c.album.strip().lower()): c
+            for c in library_candidates
+        }
+
+        for track in playlist_tracks:
+            artist = (track.get("artist") or "").strip()
+            album = (track.get("album") or "").strip()
+            if artist:
+                artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            candidate = by_album.get((artist.lower(), album.lower()))
+            if not candidate:
+                continue
+            for genre in candidate.genres:
+                genre_dist[genre] = genre_dist.get(genre, 0) + 1
+            if candidate.decade:
+                decade_dist[candidate.decade] = decade_dist.get(candidate.decade, 0) + 1
+
+        top_artists = sorted(artist_counts, key=artist_counts.get, reverse=True)[:20]
+
+        return TasteProfile(
+            genre_distribution=genre_dist,
+            decade_distribution=decade_dist,
+            top_artists=top_artists,
+            total_albums=len(library_candidates),
+            owned_albums=[
+                {"artist": c.album_artist, "album": c.album} for c in library_candidates
+            ],
+        )
+
     def select_discovery_albums(
         self,
         prompt: str,
