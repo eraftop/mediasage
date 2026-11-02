@@ -1990,6 +1990,7 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
 
             found: list[AlbumRecommendation] = []
             seen: set[str] = set()
+            artist_counts: dict[str, int] = {}
             rounds = 0
             while len(found) < request.target_albums and rounds < MAX_EXTEND_ROUNDS:
                 rounds += 1
@@ -2002,21 +2003,44 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                     session_id=session_id,
                     previously_recommended=sorted(seen) or None,
                 )
+                # `fresh` counts albums the model had not offered before;
+                # `added` counts the ones actually kept. They differ when the
+                # per-artist cap rejects something new, and the early-stop guard
+                # below must key on `fresh`: a round that offered three new
+                # albums and had them all capped still taught us something (the
+                # exclusion list grew), whereas a round that repeated itself did
+                # not and is worth stopping for.
+                fresh = 0
                 added = 0
                 for album in batch:
                     key = f"{album.artist}|||{album.album}"
                     if key in seen:
                         continue
                     seen.add(key)
+                    fresh += 1
+                    artist_key = album.artist.strip().lower()
+                    if (
+                        request.max_albums_per_artist > 0
+                        and artist_counts.get(artist_key, 0) >= request.max_albums_per_artist
+                    ):
+                        # Rejected, but still fed back below so the model stops
+                        # offering this artist and the loop can converge.
+                        continue
+                    artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
                     found.append(album)
                     added += 1
                     if len(found) >= request.target_albums:
                         break
                 pipeline.update_previously_recommended(session_id, sorted(seen))
-                if added == 0:
-                    # The model has stopped producing anything new; stop paying
-                    # for rounds that repeat themselves.
-                    logger.info("extend: round %d added nothing new, stopping", rounds)
+                logger.info(
+                    "extend: round %d offered %d new, kept %d (artist cap %d), %d/%d total",
+                    rounds, fresh, added, request.max_albums_per_artist,
+                    len(found), request.target_albums,
+                )
+                if fresh == 0:
+                    # The model is repeating itself; stop paying for rounds that
+                    # cannot move the total.
+                    logger.info("extend: round %d offered nothing new, stopping", rounds)
                     break
 
             _, cost = pipeline.get_session_costs(session_id)

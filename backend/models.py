@@ -749,6 +749,10 @@ class ExtendLibraryRequest(BaseModel):
     # for more in one call -- which would mean editing a function the existing
     # Recommended Albums tab depends on.
     target_albums: int = Field(10, ge=1, le=30)
+    # One album per band by default. Extending a library towards a playlist is
+    # better served by five artists than by five records from one -- the whole
+    # point is breadth you do not own yet. 0 means no cap.
+    max_albums_per_artist: int = Field(1, ge=0, le=10)
 
 
 class RecommendSessionState(BaseModel):

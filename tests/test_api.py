@@ -697,6 +697,98 @@ class TestExtendLibrary:
         assert data["rounds"] == 2, "should stop after the unproductive round, not keep going"
         assert pipeline.select_discovery_albums.call_count == 2
 
+
+    def test_caps_albums_per_artist(self, client):
+        """One album per band by default: a round of three by one artist yields one."""
+        batches = [
+            [self._album("Anathema", "A"), self._album("Anathema", "B"), self._album("Opeth", "C")],
+            [self._album("Anathema", "D"), self._album("Katatonia", "E"), self._album("Opeth", "F")],
+            [],  # model exhausted: fresh == 0, so the loop stops here
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 10, "max_albums_per_artist": 1,
+            })
+            data = self._complete(r.text)
+        artists = [a["artist"] for a in data["albums"]]
+        assert sorted(artists) == ["Anathema", "Katatonia", "Opeth"], artists
+        assert len(artists) == len(set(artists)), f"an artist appears twice: {artists}"
+
+    def test_artist_cap_of_two_allows_two(self, client):
+        batches = [
+            [self._album("Anathema", "A"), self._album("Anathema", "B"), self._album("Anathema", "C")],
+            [self._album("Opeth", "D")],
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 3, "max_albums_per_artist": 2,
+            })
+            data = self._complete(r.text)
+        artists = [a["artist"] for a in data["albums"]]
+        assert artists.count("Anathema") == 2, artists
+
+    def test_artist_cap_of_zero_means_no_limit(self, client):
+        batches = [[self._album("Anathema", "A"), self._album("Anathema", "B"), self._album("Anathema", "C")]]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 3, "max_albums_per_artist": 0,
+            })
+            data = self._complete(r.text)
+        assert [a["artist"] for a in data["albums"]] == ["Anathema"] * 3
+
+    def test_artist_cap_is_case_and_whitespace_insensitive(self, client):
+        batches = [
+            [self._album("Anathema", "A"), self._album(" anathema ", "B"), self._album("Opeth", "C")],
+            [],  # model exhausted
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            r = client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 5, "max_albums_per_artist": 1,
+            })
+            data = self._complete(r.text)
+        artists = [a["artist"].strip().lower() for a in data["albums"]]
+        assert artists.count("anathema") == 1, artists
+
+    def test_capped_artists_are_fed_back_so_the_model_stops_suggesting_them(self, client):
+        """A rejected album still goes into previously_recommended.
+
+        Without this the loop asks the model for more, gets the same artist
+        again, rejects it again, and bills for every round of that.
+        """
+        batches = [
+            [self._album("Anathema", "A"), self._album("Anathema", "B"), self._album("Opeth", "C")],
+            [self._album("Katatonia", "D")],
+        ]
+        pipeline = self._pipeline(batches)
+        ps = self._patches(pipeline)
+        with ExitStack() as stack:
+            for p_ in ps:
+                stack.enter_context(p_)
+            client.post("/api/extend/stream", json={
+                "result_id": "r1", "target_albums": 4, "max_albums_per_artist": 1,
+            }).read()
+        second_call = pipeline.select_discovery_albums.call_args_list[1]
+        passed = second_call.kwargs.get("previously_recommended") or []
+        assert "Anathema|||B" in passed, (
+            f"the rejected album must be excluded next round; got {passed}"
+        )
+
     def test_rejects_an_out_of_range_target(self, client):
         r = client.post("/api/extend/stream", json={"result_id": "r1", "target_albums": 99})
         assert r.status_code == 422

@@ -100,7 +100,7 @@ const state = {
     maxTracksPerAlbum: 0,  // 0 = no cap, matching the backend default
 
     // Extend Library
-    extend: { step: 'input', targetAlbums: 10, playlists: [], albums: [], busy: false },
+    extend: { step: 'input', targetAlbums: 10, maxPerArtist: 1, playlists: [], albums: [], busy: false },
     minRating: 0,  // Plex 0-10 scale: 0 = any, 1 = half a star ... 10 = five stars
 
     // Results
@@ -5900,7 +5900,11 @@ async function runExtend() {
         const res = await fetch('/api/extend/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ result_id: resultId, target_albums: state.extend.targetAlbums }),
+            body: JSON.stringify({
+                result_id: resultId,
+                target_albums: state.extend.targetAlbums,
+                max_albums_per_artist: state.extend.maxPerArtist,
+            }),
         });
         if (!res.ok) {
             const detail = await res.json().catch(() => ({}));
@@ -5953,6 +5957,16 @@ function initExtendLibrary() {
         btn.addEventListener('click', () => {
             state.extend.targetAlbums = parseInt(btn.dataset.extendCount);
             document.querySelectorAll('.extend-count-btn').forEach(b => {
+                const active = b === btn;
+                b.classList.toggle('active', active);
+                b.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+        });
+    });
+    document.querySelectorAll('.extend-artist-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            state.extend.maxPerArtist = parseInt(btn.dataset.extendArtist);
+            document.querySelectorAll('.extend-artist-btn').forEach(b => {
                 const active = b === btn;
                 b.classList.toggle('active', active);
                 b.setAttribute('aria-pressed', active ? 'true' : 'false');
