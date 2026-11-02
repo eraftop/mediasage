@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT_ERRORS = (httpx.TimeoutException, anthropic.APITimeoutError, openai.APITimeoutError)
 
+# Set by the app at startup to persist per-call spend. Left None in tests and in
+# any context without storage, where every call simply goes unrecorded.
+_cost_recorder = None
+
+
+def set_cost_recorder(recorder) -> None:
+    """Install the callable that persists one call's cost."""
+    global _cost_recorder
+    _cost_recorder = recorder
+
 
 # Tokens per track (based on real-world testing, Feb 2026)
 TOKENS_PER_TRACK = 40
@@ -283,7 +293,9 @@ class LLMClient:
             model=model,
         )
 
-    def _complete(self, prompt: str, system: str, model: str) -> LLMResponse:
+    def _complete(
+        self, prompt: str, system: str, model: str, call_type: str = "other"
+    ) -> LLMResponse:
         """Make a completion request to the configured provider."""
         complete = {
             "anthropic": self._complete_anthropic,
@@ -311,6 +323,29 @@ class LLMClient:
                 "Settings, or send fewer tracks to the AI."
             ) from e
         response.local = self.provider in ("ollama", "custom")
+        # Record what that call cost. Hooked here because _complete() is the one
+        # place every call passes through -- analyze() and generate() both return
+        # it, so playlists, narratives, recommendations and library-extension all
+        # land in the ledger without each caller remembering to log.
+        #
+        # Injected rather than imported so this module keeps no dependency on
+        # storage, and so tests can assert on the calls without a database.
+        # Local providers are skipped: Ollama costs nothing per token, and
+        # recording zeros would dilute the averages.
+        if _cost_recorder and not response.local:
+            try:
+                _cost_recorder(
+                    model=response.model,
+                    call_type=call_type,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cost=estimate_cost_for_model(
+                        response.model, response.input_tokens, response.output_tokens,
+                        config=self.config,
+                    ),
+                )
+            except Exception:
+                logger.exception("cost recording failed; continuing")
         return response
 
     def analyze(self, prompt: str, system: str) -> LLMResponse:
@@ -324,7 +359,7 @@ class LLMClient:
             LLMResponse with content and token counts
         """
         model = self.config.model_analysis
-        return self._complete(prompt, system, model)
+        return self._complete(prompt, system, model, call_type="analysis")
 
     def generate(self, prompt: str, system: str) -> LLMResponse:
         """Use the generation model for track selection.
@@ -342,7 +377,7 @@ class LLMClient:
             model = self.config.model_analysis
         else:
             model = self.config.model_generation
-        return self._complete(prompt, system, model)
+        return self._complete(prompt, system, model, call_type="generation")
 
     def _extract_json_bounds(self, content: str) -> str | None:
         """Extract JSON array or object from content with extra text.

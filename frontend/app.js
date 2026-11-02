@@ -5788,6 +5788,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Initialize views AFTER config is loaded
     initExtendLibrary();  // binds handlers once; cheap and view-independent
+    refreshSpend();
     if (state.view === 'recommend') {
         initRecommendView();
     } else if (state.view === 'extend') {
@@ -5937,6 +5938,7 @@ async function runExtend() {
                     state.extend.albums = payload.albums || [];
                     renderExtendResults(state.extend.albums, payload.rounds, payload.cost);
                     setExtendStep('results');
+                    refreshSpend();
                     done = true;
                 } else if (event === 'error' && payload) {
                     throw new Error(payload.message || 'Unknown error');
@@ -5979,5 +5981,32 @@ function initExtendLibrary() {
         setExtendStep('input');
         loadExtendPlaylists();
     });
+}
+
+// =============================================================================
+// Spend (this app's own ledger, not the account balance)
+// =============================================================================
+
+async function refreshSpend() {
+    const el = document.getElementById('footer-spend');
+    const sep = document.querySelector('.footer-spend-sep');
+    if (!el) return;
+    try {
+        const res = await fetch('/api/spend');
+        if (!res.ok) return;
+        const data = await res.json();
+        const all = data.all_time || {};
+        if (!all.calls) {
+            el.hidden = true;
+            if (sep) sep.hidden = true;
+            return;
+        }
+        const recent = (data.last_30_days || {}).cost || 0;
+        el.textContent = `$${all.cost.toFixed(2)} spent (${all.calls} calls, $${recent.toFixed(2)} in 30d)`;
+        el.hidden = false;
+        if (sep) sep.hidden = false;
+    } catch {
+        // A missing spend line is not worth an error anywhere visible.
+    }
 }
 

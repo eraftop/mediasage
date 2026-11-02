@@ -147,6 +147,27 @@ def init_schema(conn: sqlite3.Connection) -> bool:
 
         CREATE INDEX IF NOT EXISTS idx_results_type_created ON results(type, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_results_created_at ON results(created_at DESC);
+
+        -- Costs table: what this app has spent, per LLM call.
+        --
+        -- Local rather than from the provider on purpose. Anthropic exposes no
+        -- credit-balance endpoint; its cost report is organization-wide and needs
+        -- an Admin API key, which can create and delete API keys and read every
+        -- workspace -- far too much authority to hold in order to display a
+        -- number. Recording each call here is both narrower and more useful: it
+        -- answers "what does MediaSage cost me", not "what does my whole
+        -- account cost me".
+        CREATE TABLE IF NOT EXISTS costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL,
+            call_type TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cost REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_costs_created_at ON costs(created_at DESC);
     """)
 
     # Migration: add parent_rating_key column if missing (for pre-existing databases)
@@ -1197,3 +1218,71 @@ def delete_result(result_id: str) -> bool:
         return deleted
     finally:
         conn.close()
+
+
+def record_cost(
+    model: str,
+    call_type: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+) -> None:
+    """Record one LLM call's spend.
+
+    Deliberately swallows its own errors: a bookkeeping failure must never break
+    a playlist the user is waiting for. A missing row is a wrong total; a raised
+    exception here would be a broken feature.
+    """
+    try:
+        conn = ensure_db_initialized()
+        conn.execute(
+            "INSERT INTO costs (model, call_type, input_tokens, output_tokens, cost) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (model, call_type, int(input_tokens), int(output_tokens), float(cost)),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("record_cost failed; continuing without it")
+
+
+def get_spend_summary(days: int | None = None) -> dict[str, Any]:
+    """Total spend, optionally limited to the last `days` days."""
+    conn = ensure_db_initialized()
+    where = ""
+    params: tuple = ()
+    if days is not None:
+        where = "WHERE created_at >= datetime('now', ?)"
+        params = (f"-{int(days)} days",)
+
+    row = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(input_tokens), 0), "
+        f"COALESCE(SUM(output_tokens), 0), MIN(created_at) FROM costs {where}",
+        params,
+    ).fetchone()
+
+    by_type = [
+        {"call_type": r[0], "calls": r[1], "cost": r[2]}
+        for r in conn.execute(
+            f"SELECT call_type, COUNT(*), COALESCE(SUM(cost), 0) FROM costs {where} "
+            f"GROUP BY call_type ORDER BY SUM(cost) DESC",
+            params,
+        )
+    ]
+    by_model = [
+        {"model": r[0], "calls": r[1], "cost": r[2]}
+        for r in conn.execute(
+            f"SELECT model, COUNT(*), COALESCE(SUM(cost), 0) FROM costs {where} "
+            f"GROUP BY model ORDER BY SUM(cost) DESC",
+            params,
+        )
+    ]
+    return {
+        "calls": row[0],
+        "cost": round(row[1], 4),
+        "input_tokens": row[2],
+        "output_tokens": row[3],
+        "since": row[4],
+        "days": days,
+        "by_call_type": by_type,
+        "by_model": by_model,
+    }

@@ -1060,3 +1060,68 @@ class TestProviderRequestParams:
 
         assert kwargs["max_tokens"] == 8192
         assert "max_completion_tokens" not in kwargs
+
+class TestCostRecording:
+    """The recorder hook must fire for cloud calls and skip local ones."""
+
+    def _client(self, provider, model="claude-haiku-5-5"):
+        from unittest.mock import MagicMock
+        from backend.llm_client import LLMClient, LLMResponse
+        cfg = MagicMock()
+        cfg.provider = provider
+        cfg.api_key = "k"
+        cfg.model_analysis = model
+        cfg.model_generation = model
+        cfg.smart_generation = False
+        cfg.request_timeout = 60
+        client = LLMClient(cfg)
+        client._complete_anthropic = lambda p, s, m: LLMResponse(
+            content="{}", input_tokens=1000, output_tokens=100, model=m
+        )
+        client._complete_ollama = client._complete_anthropic
+        return client
+
+    def test_cloud_call_is_recorded_with_its_call_type(self, monkeypatch):
+        import backend.llm_client as mod
+        seen = []
+        mod.set_cost_recorder(lambda **kw: seen.append(kw))
+        try:
+            self._client("anthropic").generate("p", "s")
+        finally:
+            mod.set_cost_recorder(None)
+        assert len(seen) == 1, seen
+        assert seen[0]["call_type"] == "generation"
+        assert seen[0]["input_tokens"] == 1000
+        assert seen[0]["cost"] > 0
+
+    def test_analysis_calls_are_labelled_separately(self):
+        import backend.llm_client as mod
+        seen = []
+        mod.set_cost_recorder(lambda **kw: seen.append(kw))
+        try:
+            self._client("anthropic").analyze("p", "s")
+        finally:
+            mod.set_cost_recorder(None)
+        assert seen[0]["call_type"] == "analysis"
+
+    def test_local_providers_are_not_recorded(self):
+        """Ollama costs nothing per token; zeros would dilute the averages."""
+        import backend.llm_client as mod
+        seen = []
+        mod.set_cost_recorder(lambda **kw: seen.append(kw))
+        try:
+            self._client("ollama", model="llama3:8b").generate("p", "s")
+        finally:
+            mod.set_cost_recorder(None)
+        assert seen == []
+
+    def test_a_recorder_that_raises_does_not_break_the_call(self):
+        import backend.llm_client as mod
+        def boom(**kw):
+            raise RuntimeError("ledger down")
+        mod.set_cost_recorder(boom)
+        try:
+            r = self._client("anthropic").generate("p", "s")
+        finally:
+            mod.set_cost_recorder(None)
+        assert r.content == "{}", "the response must survive a bookkeeping failure"

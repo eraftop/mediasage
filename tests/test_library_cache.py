@@ -939,3 +939,58 @@ class TestHalfStarRatings:
         assert library_cache.count_tracks_by_filters(min_rating=7) == 3   # 3.5 stars and up
         assert library_cache.count_tracks_by_filters(min_rating=8) == 2
         assert library_cache.count_tracks_by_filters(min_rating=10) == 1  # five stars only
+
+class TestSpendLedger:
+    """Tests for the local spend ledger.
+
+    Local rather than from the provider on purpose: Anthropic exposes no
+    credit-balance endpoint, and its cost report is organization-wide and needs
+    an Admin API key that can create and delete API keys. This answers the
+    narrower and more useful question -- what does MediaSage cost.
+    """
+
+    def test_records_and_totals(self, initialized_db):
+        library_cache.record_cost("claude-haiku-5-5", "generation", 1000, 100, 0.25)
+        library_cache.record_cost("claude-sonnet-5-5", "analysis", 500, 50, 0.75)
+        s = library_cache.get_spend_summary()
+        assert s["calls"] == 2
+        assert s["cost"] == 1.0
+        assert s["input_tokens"] == 1500
+        assert s["output_tokens"] == 150
+
+    def test_groups_by_call_type_and_model(self, initialized_db):
+        library_cache.record_cost("claude-haiku-5-5", "generation", 10, 1, 0.10)
+        library_cache.record_cost("claude-haiku-5-5", "generation", 10, 1, 0.20)
+        library_cache.record_cost("claude-sonnet-5-5", "analysis", 10, 1, 0.05)
+        s = library_cache.get_spend_summary()
+        by_type = {r["call_type"]: r for r in s["by_call_type"]}
+        assert by_type["generation"]["calls"] == 2
+        assert round(by_type["generation"]["cost"], 4) == 0.30
+        by_model = {r["model"]: r for r in s["by_model"]}
+        assert by_model["claude-sonnet-5-5"]["calls"] == 1
+        # Ordered most expensive first, which is what a summary line wants.
+        assert s["by_model"][0]["model"] == "claude-haiku-5-5"
+
+    def test_empty_ledger_reports_zero_not_an_error(self, initialized_db):
+        s = library_cache.get_spend_summary()
+        assert s["calls"] == 0 and s["cost"] == 0
+        assert s["by_call_type"] == [] and s["by_model"] == []
+
+    def test_day_window_filters(self, initialized_db):
+        library_cache.record_cost("m", "generation", 1, 1, 1.0)
+        conn = library_cache.ensure_db_initialized()
+        # Backdate one row well outside a 30-day window.
+        conn.execute("UPDATE costs SET created_at = datetime('now', '-90 days')")
+        conn.commit()
+        library_cache.record_cost("m", "generation", 1, 1, 2.0)
+        assert library_cache.get_spend_summary()["calls"] == 2
+        recent = library_cache.get_spend_summary(days=30)
+        assert recent["calls"] == 1, "the 90-day-old row must be excluded"
+        assert recent["cost"] == 2.0
+
+    def test_a_recording_failure_never_raises(self, initialized_db, monkeypatch):
+        """Bookkeeping must not break a playlist someone is waiting for."""
+        def boom(*a, **k):
+            raise RuntimeError("disk gone")
+        monkeypatch.setattr(library_cache, "ensure_db_initialized", boom)
+        library_cache.record_cost("m", "generation", 1, 1, 1.0)  # must not raise

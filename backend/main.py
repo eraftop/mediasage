@@ -93,6 +93,7 @@ from backend.jellyfin_client import JellyfinClient, get_jellyfin_client, init_je
 from backend import library_cache
 from backend.model_catalog import CATALOG_BY_ID, MODEL_CATALOG
 from backend.llm_client import (
+    set_cost_recorder,
     TOKENS_PER_ALBUM,
     estimate_cost_for_model,
     get_llm_client,
@@ -115,6 +116,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Initialize clients on startup."""
     config = get_config()
+
+    # Persist what each LLM call costs. Installed before any client is built so
+    # nothing slips through unrecorded, and injected rather than imported inside
+    # llm_client so that module keeps no dependency on storage.
+    set_cost_recorder(library_cache.record_cost)
 
     # Initialize Plex client if configured
     if config.plex.url and config.plex.token:
@@ -1733,6 +1739,20 @@ async def recommend_generate(request: RecommendGenerateRequest, raw_request: Req
 
 
 _VALID_RESULT_TYPES = {"prompt_playlist", "seed_playlist", "album_recommendation"}
+
+
+@app.get("/api/spend")
+async def get_spend() -> dict:
+    """What this app has spent, from its own ledger.
+
+    Not the account balance: Anthropic exposes no credit-balance endpoint, and
+    its cost report is organization-wide and needs an Admin API key. This is
+    narrower and more useful -- it answers what MediaSage costs, not what the
+    whole account costs.
+    """
+    all_time = await asyncio.to_thread(library_cache.get_spend_summary, None)
+    last_30 = await asyncio.to_thread(library_cache.get_spend_summary, 30)
+    return {"all_time": all_time, "last_30_days": last_30}
 
 
 @app.get("/api/results", response_model=ResultListResponse)
