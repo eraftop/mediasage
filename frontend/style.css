@@ -698,13 +698,15 @@ textarea {
     margin: 0 0 var(--spacing-md);
 }
 
-/* Track Count Selector */
-.track-count-selector {
+/* Track Count Selector (shared with the per-album cap selector) */
+.track-count-selector,
+.album-cap-selector {
     display: flex;
     gap: var(--spacing-sm);
 }
 
-.count-btn {
+.count-btn,
+.album-cap-btn {
     flex: 1;
     padding: var(--spacing-sm) var(--spacing-md);
     background: var(--bg-tertiary);
@@ -716,11 +718,13 @@ textarea {
     transition: all var(--transition-fast);
 }
 
-.count-btn:hover {
+.count-btn:hover,
+.album-cap-btn:hover {
     background: var(--bg-hover);
 }
 
-.count-btn.active {
+.count-btn.active,
+.album-cap-btn.active {
     border-color: var(--accent);
     color: var(--accent);
 }

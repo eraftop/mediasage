@@ -980,6 +980,7 @@ async def generate_playlist_sse(request: GenerateRequest) -> StreamingResponse:
             max_tracks_to_ai=request.max_tracks_to_ai,
             artists=request.artists,
             exclude_artists=request.exclude_artists,
+            max_tracks_per_album=request.max_tracks_per_album,
         )
 
     return StreamingResponse(

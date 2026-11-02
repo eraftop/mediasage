@@ -415,6 +415,17 @@
                         </div>
 
                         <div class="filter-section">
+                            <h3>Max Per Album</h3>
+                            <div class="album-cap-selector" role="group" aria-label="Maximum tracks from one album">
+                                <button class="album-cap-btn" data-cap="1" aria-pressed="false">1</button>
+                                <button class="album-cap-btn" data-cap="2" aria-pressed="false">2</button>
+                                <button class="album-cap-btn" data-cap="3" aria-pressed="false">3</button>
+                                <button class="album-cap-btn active" data-cap="0" aria-pressed="true">No cap</button>
+                            </div>
+                            <p class="filter-hint">Limits how many tracks one album can contribute. Capped slots are refilled from other albums.</p>
+                        </div>
+
+                        <div class="filter-section">
                             <label class="checkbox-label">
                                 <input type="checkbox" id="exclude-live" checked>
                                 <span>Exclude live versions</span>

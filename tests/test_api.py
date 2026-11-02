@@ -504,3 +504,63 @@ class TestApiKeyProviders:
             data = client.get("/api/config").json()
 
         assert data["api_key_providers"] == ["openai", "gemini"]
+
+class TestAlbumCapWiring:
+    """The /api/generate route must actually pass max_tracks_per_album through.
+
+    Exists because the field was added to GenerateRequest and the generator in
+    one change and NOT connected in the route -- and the 355 existing tests all
+    stayed green, because every one of them calls generate_playlist_stream()
+    directly. A field that validates but never reaches the generator is the
+    exact shape of bug this asserts against.
+    """
+
+    def test_route_forwards_the_cap_to_the_generator(self, client):
+        captured = {}
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield "event: progress\ndata: {}\n\n"
+
+        media = MagicMock()
+        media.is_connected.return_value = True
+        with patch("backend.main.get_current_media_client", return_value=media), \
+             patch("backend.main.get_llm_client", return_value=MagicMock()), \
+             patch("backend.main.generate_playlist_stream", side_effect=fake_stream):
+            r = client.post("/api/generate/stream", json={
+                "prompt": "rock",
+                "genres": [],
+                "decades": [],
+                "max_tracks_per_album": 3,
+            })
+        assert r.status_code == 200
+        # Consume the stream so the generator body actually runs.
+        r.read()
+        assert captured.get("max_tracks_per_album") == 3, (
+            f"route did not forward the cap; got {captured.get('max_tracks_per_album')!r}"
+        )
+
+    def test_route_defaults_the_cap_to_zero(self, client):
+        captured = {}
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield "event: progress\ndata: {}\n\n"
+
+        media = MagicMock()
+        media.is_connected.return_value = True
+        with patch("backend.main.get_current_media_client", return_value=media), \
+             patch("backend.main.get_llm_client", return_value=MagicMock()), \
+             patch("backend.main.generate_playlist_stream", side_effect=fake_stream):
+            r = client.post("/api/generate/stream", json={
+                "prompt": "rock", "genres": [], "decades": [],
+            })
+        assert r.status_code == 200
+        r.read()
+        assert captured.get("max_tracks_per_album") == 0
+
+    def test_route_rejects_a_negative_cap(self, client):
+        r = client.post("/api/generate/stream", json={
+            "prompt": "rock", "genres": [], "decades": [], "max_tracks_per_album": -1,
+        })
+        assert r.status_code == 422

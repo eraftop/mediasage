@@ -187,6 +187,7 @@ def generate_playlist_stream(
     max_tracks_to_ai: int = 500,
     artists: list[str] | None = None,
     exclude_artists: list[str] | None = None,
+    max_tracks_per_album: int = 0,
 ) -> Generator[str, None, None]:
     """Generate a playlist with streaming progress updates.
 
@@ -311,9 +312,41 @@ def generate_playlist_stream(
         used_keys: set[str] = set()
         track_reasons: dict[str, str] = {}
 
+        # Per-album cap. GENERATION_SYSTEM already asks the model not to over-pick
+        # from one album, but advice is not enforcement, and seed playlists ignore
+        # it most: the filtered candidate pool is itself clustered by album, so the
+        # model is choosing from a biased pool. 0 means no cap, which is the
+        # previous behaviour exactly.
+        #
+        # Keyed on (artist, album) rather than album alone, because "Greatest Hits"
+        # is not one album. The failure modes are asymmetric: keying on album alone
+        # would silently cap unrelated records that share a title, while keying on
+        # both can only under-cap a compilation whose tracks carry different artist
+        # credits. Under-capping is the safer error.
+        album_counts: dict[tuple[str, str], int] = {}
+
+        def _album_key(t: Track) -> tuple[str, str]:
+            return (t.artist.strip().lower(), t.album.strip().lower())
+
+        def _album_is_full(t: Track) -> bool:
+            if max_tracks_per_album <= 0:
+                return False
+            return album_counts.get(_album_key(t), 0) >= max_tracks_per_album
+
+        def _take(t: Track, reason: str = "") -> None:
+            matched_tracks.append(t)
+            used_keys.add(t.rating_key)
+            album_counts[_album_key(t)] = album_counts.get(_album_key(t), 0) + 1
+            if reason:
+                track_reasons[t.rating_key] = reason
+
         if seed_track:
             used_keys.add(seed_track.rating_key)
+            # The seed counts towards its own album's allowance; without this a
+            # cap of 2 yields three tracks from the seed's album.
+            album_counts[_album_key(seed_track)] = 1
 
+        capped = 0
         for selection in track_selections:
             if len(matched_tracks) >= track_count:
                 break
@@ -327,11 +360,32 @@ def generate_playlist_stream(
                     continue
 
                 if _tracks_match(artist, title, track):
-                    matched_tracks.append(track)
-                    used_keys.add(track.rating_key)
-                    if reason:
-                        track_reasons[track.rating_key] = reason
+                    if _album_is_full(track):
+                        # Drop this pick; a backfill below refills the slot from
+                        # an album that still has room.
+                        capped += 1
+                        break
+                    _take(track, reason)
                     break
+
+        # Backfill whatever the cap dropped, so a capped playlist is still the
+        # length the user asked for. filtered_tracks is already randomly sampled
+        # upstream, so taking it in order is varied without being unpredictable.
+        backfilled = 0
+        if max_tracks_per_album > 0 and len(matched_tracks) < track_count:
+            for track in filtered_tracks:
+                if len(matched_tracks) >= track_count:
+                    break
+                if track.rating_key in used_keys or _album_is_full(track):
+                    continue
+                _take(track, "Added for album variety after the per-album cap was reached.")
+                backfilled += 1
+
+        if capped or backfilled:
+            logger.info(
+                "Album cap (max %d per album): dropped %d of the model's picks, backfilled %d",
+                max_tracks_per_album, capped, backfilled,
+            )
 
         if not matched_tracks:
             if track_selections:

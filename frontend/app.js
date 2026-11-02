@@ -97,6 +97,7 @@ const state = {
     trackCount: 25,
     excludeLive: true,
     maxTracksToAI: 500,  // 0 = no limit
+    maxTracksPerAlbum: 0,  // 0 = no cap, matching the backend default
     minRating: 0,  // Plex 0-10 scale: 0 = any, 1 = half a star ... 10 = five stars
 
     // Results
@@ -1272,6 +1273,13 @@ function updateFilters() {
         btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
     });
 
+    // Update max-per-album buttons
+    document.querySelectorAll('.album-cap-btn').forEach(btn => {
+        const isActive = parseInt(btn.dataset.cap) === state.maxTracksPerAlbum;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    });
+
     // Update max tracks to AI buttons
     const maxAllowed = state.config?.max_tracks_to_ai || 3500;
     document.querySelectorAll('.limit-btn').forEach(btn => {
@@ -1450,6 +1458,7 @@ async function updateFilterPreview() {
             exclude_artists: state.excludedArtists,
             track_count: state.trackCount,
             max_tracks_to_ai: state.maxTracksToAI,
+            max_tracks_per_album: state.maxTracksPerAlbum,
             min_rating: state.minRating,
             exclude_live: state.excludeLive,
         };
@@ -2870,6 +2879,16 @@ function setupEventListeners() {
             state.trackCount = parseInt(btn.dataset.count);
             updateFilters();
             recalculateCostDisplay();
+        });
+    });
+
+    // Max tracks per album. Deliberately does NOT call recalculateCostDisplay:
+    // the cap is applied after the model has replied, so the same track list is
+    // sent either way and the cost is unchanged.
+    document.querySelectorAll('.album-cap-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            state.maxTracksPerAlbum = parseInt(btn.dataset.cap);
+            updateFilters();
         });
     });
 

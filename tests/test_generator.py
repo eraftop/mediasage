@@ -579,3 +579,147 @@ class TestNoMatches:
 
         complete = next(e for e in events if "event: complete" in e)
         assert '"track_count": 1' in complete
+
+class TestAlbumCap:
+    """Tests for max_tracks_per_album, which caps how many tracks one album may
+    contribute to a playlist.
+
+    The system prompt has always asked the model to "vary the selection - don't
+    pick too many tracks from the same album", but nothing enforced it. Seed
+    playlists suffer most: the filtered candidate pool is itself clustered by
+    album, so the model picks from a biased pool and is then merely asked to be
+    varied.
+    """
+
+    @staticmethod
+    def _album_heavy_library():
+        """Six tracks: five from one album, one from another."""
+        from backend.models import Track
+        tracks = [
+            Track(
+                rating_key=str(i),
+                title=f"Heavy Track {i}",
+                artist="One Band",
+                album="One Album",
+                duration_ms=200000,
+                year=2001,
+                genres=["Rock"],
+            )
+            for i in range(1, 6)
+        ]
+        tracks.append(
+            Track(
+                rating_key="9",
+                title="Lonely Track",
+                artist="Other Band",
+                album="Other Album",
+                duration_ms=200000,
+                year=2002,
+                genres=["Rock"],
+            )
+        )
+        return tracks
+
+    def _run(self, tracks, selections, **kwargs):
+        """Drive generate_playlist_stream with a fixed LLM reply."""
+        from backend.generator import generate_playlist_stream
+        from backend.llm_client import LLMResponse
+
+        reply = LLMResponse(
+            content=json.dumps(selections), input_tokens=10, output_tokens=10,
+            model="test-model",
+        )
+        with patch("backend.generator.get_llm_client") as mock_llm:
+            client = MagicMock()
+            client.generate.return_value = reply
+            client.analyze.return_value = LLMResponse(
+                content='{"title": "T", "narrative": "N."}',
+                input_tokens=1, output_tokens=1, model="test-model",
+            )
+            client.parse_json_response.side_effect = [
+                selections, {"title": "T", "narrative": "N."},
+            ]
+            mock_llm.return_value = client
+            with patch("backend.generator.get_current_media_client") as mock_media:
+                media = MagicMock()
+                # Mock BOTH paths: generate_playlist_stream calls
+                # get_tracks_by_filters only when genres/decades/rating/artists
+                # are set, and get_random_tracks otherwise. Mocking one leaves
+                # the other returning a MagicMock, which matches nothing and
+                # looks exactly like a broken cap.
+                media.get_tracks_by_filters.return_value = tracks
+                media.get_random_tracks.return_value = tracks
+                mock_media.return_value = media
+                with patch("backend.generator.library_cache.has_cached_tracks", return_value=False):
+                    with patch("backend.generator.library_cache.save_result", return_value="x"):
+                        events = _parse_sse_events(
+                            generate_playlist_stream(track_count=5, **kwargs)
+                        )
+        keys = []
+        for etype, data in events:
+            if etype == "tracks":
+                keys.extend(t["rating_key"] for t in data["batch"])
+        return keys, {k: v for k, v in events}
+
+    def test_without_a_cap_one_album_can_dominate(self):
+        """Baseline: the current behaviour, which is what the cap exists to fix."""
+        tracks = self._album_heavy_library()
+        selections = [
+            {"artist": "One Band", "album": "One Album", "title": f"Heavy Track {i}"}
+            for i in range(1, 6)
+        ]
+        keys, _ = self._run(tracks, selections, prompt="rock")
+        assert len(keys) == 5
+        assert keys == ["1", "2", "3", "4", "5"]
+
+    def test_cap_limits_tracks_from_one_album(self):
+        """With max_tracks_per_album=2, only two of the five may be used."""
+        tracks = self._album_heavy_library()
+        selections = [
+            {"artist": "One Band", "album": "One Album", "title": f"Heavy Track {i}"}
+            for i in range(1, 6)
+        ]
+        keys, _ = self._run(tracks, selections, prompt="rock", max_tracks_per_album=2)
+        from_one_album = [k for k in keys if k in {"1", "2", "3", "4", "5"}]
+        assert len(from_one_album) == 2, f"expected 2 from One Album, got {from_one_album}"
+
+    def test_cap_backfills_from_other_albums(self):
+        """A capped slot is refilled from the library rather than left empty."""
+        tracks = self._album_heavy_library()
+        selections = [
+            {"artist": "One Band", "album": "One Album", "title": f"Heavy Track {i}"}
+            for i in range(1, 6)
+        ]
+        keys, _ = self._run(tracks, selections, prompt="rock", max_tracks_per_album=2)
+        assert "9" in keys, "the track from Other Album should have been backfilled in"
+
+    def test_cap_of_zero_means_no_limit(self):
+        """0 preserves the previous behaviour exactly, so the default is safe."""
+        tracks = self._album_heavy_library()
+        selections = [
+            {"artist": "One Band", "album": "One Album", "title": f"Heavy Track {i}"}
+            for i in range(1, 6)
+        ]
+        keys, _ = self._run(tracks, selections, prompt="rock", max_tracks_per_album=0)
+        assert keys == ["1", "2", "3", "4", "5"]
+
+    def test_same_album_name_by_different_artists_counts_separately(self):
+        """'Greatest Hits' is not one album. Cap on (artist, album), not album."""
+        from backend.models import Track
+        tracks = [
+            Track(rating_key="a1", title="A1", artist="Band A", album="Greatest Hits",
+                  duration_ms=1000, year=2000, genres=["Rock"]),
+            Track(rating_key="a2", title="A2", artist="Band A", album="Greatest Hits",
+                  duration_ms=1000, year=2000, genres=["Rock"]),
+            Track(rating_key="b1", title="B1", artist="Band B", album="Greatest Hits",
+                  duration_ms=1000, year=2000, genres=["Rock"]),
+        ]
+        selections = [
+            {"artist": "Band A", "album": "Greatest Hits", "title": "A1"},
+            {"artist": "Band A", "album": "Greatest Hits", "title": "A2"},
+            {"artist": "Band B", "album": "Greatest Hits", "title": "B1"},
+        ]
+        keys, _ = self._run(tracks, selections, prompt="hits", max_tracks_per_album=2)
+        assert set(keys) == {"a1", "a2", "b1"}, (
+            "Band B's Greatest Hits must not be capped by Band A's"
+        )

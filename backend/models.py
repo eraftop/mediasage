@@ -266,6 +266,10 @@ class GenerateRequest(BaseModel):
     exclude_live: bool = True
     min_rating: int = Field(0, ge=0, le=10)  # Plex 0-10 scale (half star = 1); 0 = any
     max_tracks_to_ai: int = 500  # 0 = no limit
+    # Cap how many tracks one album may contribute. 0 = no cap, which is the
+    # behaviour before this field existed, so the default changes nothing for
+    # anyone who does not set it.
+    max_tracks_per_album: int = Field(0, ge=0, le=25)
 
     @model_validator(mode="after")
     def check_flow(self) -> "GenerateRequest":
