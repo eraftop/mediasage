@@ -698,15 +698,26 @@ textarea {
     margin: 0 0 var(--spacing-md);
 }
 
-/* Track Count Selector (shared with the per-album cap selector) */
+/* Track Count Selector, shared with the per-album cap and the Extend Library
+   selectors.
+   DO NOT give those buttons the `count-btn` class to borrow this styling. That
+   class is also a BEHAVIOUR hook: a click handler on `.count-btn` writes
+   state.trackCount from `data-count` and then calls updateFilters(), which
+   re-syncs every `.count-btn`'s active state. A borrowed class therefore set
+   trackCount to NaN and stripped the highlight off the other group -- the bug
+   reported on 2026-11-02. Add the new class to the selector lists here
+   instead. */
 .track-count-selector,
-.album-cap-selector {
+.album-cap-selector,
+.extend-selector {
     display: flex;
     gap: var(--spacing-sm);
 }
 
 .count-btn,
-.album-cap-btn {
+.album-cap-btn,
+.extend-count-btn,
+.extend-artist-btn {
     flex: 1;
     padding: var(--spacing-sm) var(--spacing-md);
     background: var(--bg-tertiary);
@@ -719,12 +730,16 @@ textarea {
 }
 
 .count-btn:hover,
-.album-cap-btn:hover {
+.album-cap-btn:hover,
+.extend-count-btn:hover,
+.extend-artist-btn:hover {
     background: var(--bg-hover);
 }
 
 .count-btn.active,
-.album-cap-btn.active {
+.album-cap-btn.active,
+.extend-count-btn.active,
+.extend-artist-btn.active {
     border-color: var(--accent);
     color: var(--accent);
 }
