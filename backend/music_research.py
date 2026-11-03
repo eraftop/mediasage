@@ -10,12 +10,14 @@ import logging
 import re
 import socket
 import time
+import unicodedata
+from difflib import SequenceMatcher
 from urllib.parse import unquote, urlparse
 
 import httpx
 from readability import Document as ReadableDocument
 
-from backend.models import ResearchData
+from backend.models import AlbumVerification, ResearchData
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,191 @@ def _is_safe_url(url: str) -> bool:
         return True
     except (ValueError, socket.gaierror):
         return False
+
+
+# --- Strict existence check (Extend Library) --------------------------------
+#
+# search_album() above is built to FIND SOMETHING for a pitch: its first step is
+# a phrase search, so a query for "Blue" also returns "Kind of Blue", and its
+# fallback drops the artist altogether. That leniency is right for research and
+# wrong for verification, where a made-up title by a real artist must come back
+# as "not found". So verification compares names itself, after normalising.
+
+# Only these primary types count. Without it, an invented album that shares its
+# name with a real single would pass.
+VERIFY_ACCEPTED_TYPES = {"Album", "EP", None}
+
+# Letters NFKD does not decompose: without this "Agaetis" never matches
+# "Ágætis" (found against the live API, 2026-11-03).
+_FOLD = str.maketrans({"æ": "ae", "ø": "o", "œ": "oe", "ð": "d", "þ": "th",
+                       "ł": "l", "đ": "d", "ı": "i"})
+
+# A model writes "Lift Your Skinny Fists..." for "Lift Yr. Skinny Fists...!".
+# Applied only once the artist matches; "Blue" vs "Kind of Blue" scores 0.5.
+TITLE_FUZZY_MIN = 0.88
+
+# Numbers mark different releases, and the fuzzy ratio barely notices them:
+# "Led Zeppelin II" vs "III" scores 0.97, "Opiate" vs "Opiate²" 0.92 (the latter
+# verified the 1992 EP for the 2022 single on 2026-11-03). Fuzzy matching is
+# only allowed between titles whose numbers agree exactly.
+_ROMAN = {"ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii", "xiii"}
+
+
+def _numerals(key: str) -> tuple:
+    return tuple(sorted(re.findall(r"\d+", key) + [w for w in key.split() if w in _ROMAN]))
+
+
+# Lucene syntax characters, removed from unquoted search terms.
+_LUCENE_SPECIAL = re.compile(r'[+\-&|!(){}\[\]^"~*?:\\/]')
+
+# MusicBrainz answers 503 with `x-ratelimit-who: search-shed` when its search
+# servers shed load -- globally, not at this client (measured 2026-11-03: about
+# one search in five, regardless of User-Agent, and a shed can outlast 6s).
+MB_RETRY_STATUSES = {429, 503}
+MB_RETRY_DELAYS = (2.0, 4.0, 8.0)
+
+_TRAILING_QUALIFIER = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$")
+
+
+def _lucene_escape(text: str) -> str:
+    """Escape a value for use inside a quoted Lucene phrase."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def normalize_name(name: str) -> str:
+    """Fold a name to a comparison key: case, accents, '&', a leading 'The'
+    and punctuation all stop mattering. Non-Latin letters (Greek included) are
+    kept, since \\w is Unicode-aware."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.casefold().translate(_FOLD).replace("&", " and ")
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if s.startswith("the "):
+        s = s[4:]
+    return s
+
+
+def _title_keys(title: str) -> set[str]:
+    """The title as given, and without trailing "(Deluxe Edition)"-style
+    qualifiers, stripped repeatedly."""
+    keys = {normalize_name(title)}
+    t = title
+    while True:
+        stripped = _TRAILING_QUALIFIER.sub("", t)
+        if stripped == t or not stripped.strip():
+            break
+        t = stripped
+        keys.add(normalize_name(t))
+    keys.discard("")
+    return keys
+
+
+def _credit_names(rg: dict) -> set[str]:
+    """Every way the release group's artist credit can be read: each credited
+    artist on its own, and the whole credit as printed ("Simon & Garfunkel",
+    "Lou Reed & John Cale")."""
+    names: set[str] = set()
+    joined = ""
+    for credit in rg.get("artist-credit", []) or []:
+        if isinstance(credit, str):
+            joined += credit
+            continue
+        name = credit.get("name") or (credit.get("artist") or {}).get("name") or ""
+        names.add(normalize_name(name))
+        artist_name = (credit.get("artist") or {}).get("name")
+        if artist_name:
+            names.add(normalize_name(artist_name))
+        joined += name + (credit.get("joinphrase") or "")
+    names.add(normalize_name(joined))
+    names.discard("")
+    return names
+
+
+def album_keys(artist: str, album: str) -> set[tuple[str, str]]:
+    """Comparison keys for one album: the normalised artist with each title
+    form, so "OK Computer (Remastered)" in a library matches "OK Computer"."""
+    a = normalize_name(artist)
+    return {(a, t) for t in _title_keys(album)} if a else set()
+
+
+def has_non_album_release(candidates: list[dict], artist: str, album: str) -> bool:
+    """True if the artist has a release by exactly this title that the type
+    filter excluded -- a single, broadcast or "Other". Real, but not an album."""
+    want_artist = normalize_name(artist)
+    want_titles = _title_keys(album)
+    return any(
+        rg.get("primary-type") not in VERIFY_ACCEPTED_TYPES
+        and want_artist in _credit_names(rg)
+        and want_titles & _title_keys(rg.get("title", ""))
+        for rg in candidates
+    )
+
+
+# Secondary types that mark a derivative of some other release. Still accepted
+# when nothing better matches (a live album suggested by its real name is
+# real), but they must lose to the original: on 2026-11-03 "Alice in Chains --
+# Jar of Flies" verified as a 2012 DJ remix bootleg, "Jar of Flies (Chopped Not
+# Slopped by DJ Lil Steve)", because stripping the qualifier made the titles
+# equal and an Album-over-EP tiebreak then preferred it to the real 1994 EP.
+DERIVATIVE_TYPES = {"Remix", "DJ-mix", "Mixtape/Street", "Live", "Compilation",
+                    "Demo", "Interview", "Spokenword", "Audiobook"}
+
+
+def match_release_group(
+    candidates: list[dict], artist: str, album: str, year: int | None = None
+) -> dict | None:
+    """Return the candidate that IS this album, or None.
+
+    Requires an artist match and a title match. Among matches, ranked by:
+      1. title closeness -- exact full title (100) > equal only once "(...)"
+         qualifiers are stripped (50) > fuzzy (0..10). This dominates.
+      2. derivative releases (remix, live, compilation...) -20
+      3. year agrees +5, and primary type Album +2
+      4. earliest first release, as the final tiebreak
+    A year disagreement is never disqualifying; models are often a year out.
+    """
+    want_artist = normalize_name(artist)
+    want_full = normalize_name(album)
+    want_titles = _title_keys(album)
+    if not want_artist or not want_titles:
+        return None
+    best, best_rank = None, None
+    for rg in candidates:
+        if rg.get("primary-type") not in VERIFY_ACCEPTED_TYPES:
+            continue
+        if want_artist not in _credit_names(rg):
+            continue
+        have_full = normalize_name(rg.get("title", ""))
+        have_titles = _title_keys(rg.get("title", ""))
+        if want_full and want_full == have_full:
+            score = 100.0
+        elif want_titles & have_titles:
+            score = 50.0
+        else:
+            ratio = max(
+                (SequenceMatcher(None, w, h).ratio()
+                 for w in want_titles for h in have_titles
+                 if _numerals(w) == _numerals(h)),
+                default=0.0,
+            )
+            if ratio < TITLE_FUZZY_MIN:
+                continue
+            score = ratio * 10
+        if set(rg.get("secondary-types") or []) & DERIVATIVE_TYPES:
+            score -= 20
+        if year and str(rg.get("first-release-date", "")).startswith(str(year)):
+            score += 5
+        if rg.get("primary-type") == "Album":
+            score += 2
+        # Earlier first release wins remaining ties; undated sorts last.
+        date = str(rg.get("first-release-date") or "9999")
+        rank = (score, tuple(-ord(ch) for ch in date))
+        if best_rank is None or rank > best_rank:
+            best, best_rank = rg, rank
+    return best
 
 
 class MusicResearchClient:
@@ -623,6 +810,80 @@ class MusicResearchClient:
                     research.review_texts.append(text)
 
         return research
+
+    async def verify_album(
+        self, artist: str, album: str, year: int | None = None
+    ) -> AlbumVerification:
+        """Check that `artist` really released `album`.
+
+        At most two searches. The first is artist phrase + title WORDS (not the
+        title phrase, which misses "Your" vs "Yr."); the second is the title
+        phrase alone, for artist spellings the phrase search misses. Every
+        candidate is then judged by match_release_group, not by search rank.
+        Any failure that survives the retries returns `unavailable`, never
+        `not_found`.
+        """
+        bare = album
+        while (stripped := _TRAILING_QUALIFIER.sub("", bare).strip()) and stripped != bare:
+            bare = stripped
+        # The title's OWN words, minus Lucene syntax, lower-cased so a word like
+        # AND is not read as an operator. Not normalize_name(): MusicBrainz
+        # folds on its side, and pre-folding "Opiate²" to "opiate2" made it miss.
+        terms = " ".join(_LUCENE_SPECIAL.sub(" ", bare).casefold().split()) or normalize_name(album)
+        queries = [
+            (f'artist:"{_lucene_escape(artist)}" AND releasegroup:({terms})', 25),
+            (f'releasegroup:"{_lucene_escape(bare)}"', 25),
+        ]
+        seen: list[dict] = []
+        try:
+            client = await self._get_client()
+            for query, limit in queries:
+                data = await self._mb_search(client, query, limit)
+                seen.extend(data.get("release-groups", []))
+                rg = match_release_group(data.get("release-groups", []), artist, album, year)
+                if rg:
+                    credit = "".join(
+                        c if isinstance(c, str) else (c.get("name", "") + (c.get("joinphrase") or ""))
+                        for c in rg.get("artist-credit", []) or []
+                    ).strip()
+                    date = str(rg.get("first-release-date") or "")
+                    return AlbumVerification(
+                        status="verified",
+                        musicbrainz_id=rg.get("id"),
+                        artist=credit or artist,
+                        album=rg.get("title") or album,
+                        year=int(date[:4]) if date[:4].isdigit() else year,
+                    )
+        except Exception as e:  # noqa: BLE001 - any failure means "could not check"
+            logger.warning("MusicBrainz verification unavailable for %s — %s: %s", artist, album, e)
+            return AlbumVerification(status="unavailable")
+        if has_non_album_release(seen, artist, album):
+            logger.info("In MusicBrainz but not as an album, dropping: %s — %s", artist, album)
+            return AlbumVerification(status="not_album")
+        logger.info("Not in MusicBrainz, dropping: %s — %s", artist, album)
+        return AlbumVerification(status="not_found")
+
+    async def _mb_search(self, client: httpx.AsyncClient, query: str, limit: int) -> dict:
+        """One rate-limited release-group search, retrying 503/429 with backoff
+        (and Retry-After when given). Raises once the retries are spent."""
+        for attempt in range(len(MB_RETRY_DELAYS) + 1):
+            await self._rate_limit()
+            resp = await client.get(
+                f"{MB_BASE_URL}/release-group",
+                params={"query": query, "fmt": "json", "limit": limit},
+            )
+            if resp.status_code in MB_RETRY_STATUSES and attempt < len(MB_RETRY_DELAYS):
+                delay = MB_RETRY_DELAYS[attempt]
+                try:
+                    delay = max(delay, min(float(resp.headers.get("Retry-After", 0)), 10.0))
+                except ValueError:
+                    pass
+                logger.info("MusicBrainz %s, retrying in %.0fs", resp.status_code, delay)
+                await asyncio.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     async def close(self) -> None:
         """Close the HTTP client."""

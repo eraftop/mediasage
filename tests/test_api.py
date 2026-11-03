@@ -590,14 +590,154 @@ class TestExtendLibrary:
             ]},
         }
 
-    def _patches(self, pipeline, result=None, has_cache=True):
+    class _FakeVerifier:
+        """Stands in for MusicResearchClient.verify_album. Every album is
+        verified as-is unless `statuses` maps its (artist, album) to
+        "not_found", "unavailable", or an AlbumVerification to return."""
+
+        def __init__(self, statuses=None):
+            self.statuses = statuses or {}
+            self.calls = []
+
+        async def verify_album(self, artist, album, year=None):
+            from backend.models import AlbumVerification
+            self.calls.append((artist, album))
+            st = self.statuses.get((artist, album), "verified")
+            if isinstance(st, AlbumVerification):
+                return st
+            if st == "verified":
+                return AlbumVerification(status="verified", musicbrainz_id="00000000-0000-0000-0000-000000000000",
+                                         artist=artist, album=album, year=year)
+            return AlbumVerification(status=st)
+
+    def _patches(self, pipeline, result=None, has_cache=True, verifier=None, candidates=None):
         return [
+            patch("backend.main._get_research_client",
+                  return_value=verifier if verifier is not None else self._FakeVerifier()),
             patch("backend.main._get_pipeline", return_value=pipeline),
             patch("backend.main.library_cache.get_result",
                   return_value=self._result() if result is None else result),
             patch("backend.main.library_cache.has_cached_tracks", return_value=has_cache),
-            patch("backend.main.library_cache.get_album_candidates", return_value=[]),
+            patch("backend.main.library_cache.get_album_candidates", return_value=candidates or []),
         ]
+
+    def _run(self, pipeline, body, **kw):
+        with ExitStack() as stack:
+            for p_ in self._patches(pipeline, **kw):
+                stack.enter_context(p_)
+            from backend.main import app
+            r = TestClient(app).post("/api/extend/stream", json=body)
+        return r, self._complete(r.text)
+
+    # --- MusicBrainz verification ------------------------------------------
+
+    def test_albums_not_in_musicbrainz_are_dropped_and_reported(self):
+        batches = [
+            [self._album("A", "1"), self._album("B", "fake"), self._album("C", "3")],
+            [self._album("D", "4"), self._album("E", "5"), self._album("F", "6")],
+        ]
+        pipeline = self._pipeline(batches)
+        v = self._FakeVerifier({("B", "fake"): "not_found"})
+        r, data = self._run(pipeline, {"result_id": "r1", "target_albums": 4}, verifier=v)
+        names = [a["album"] for a in data["albums"]]
+        assert "fake" not in names
+        assert names == ["1", "3", "4", "5"]
+        assert data["rejected"] == [{"artist": "B", "album": "fake", "reason": "not_found"}]
+        assert all(a["verified"] is True for a in data["albums"])
+
+    def test_single_is_dropped_with_its_own_reason(self):
+        pipeline = self._pipeline([[self._album("Tool", "Opiate²"), self._album("A", "1")], []])
+        v = self._FakeVerifier({("Tool", "Opiate²"): "not_album"})
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 2}, verifier=v)
+        assert [a["album"] for a in data["albums"]] == ["1"]
+        assert data["rejected"] == [{"artist": "Tool", "album": "Opiate²", "reason": "not_album"}]
+
+    def test_dropped_album_is_fed_back_so_it_is_not_offered_again(self):
+        batches = [
+            [self._album("B", "fake"), self._album("A", "1")],
+            [self._album("C", "2")],
+        ]
+        pipeline = self._pipeline(batches)
+        self._run(pipeline, {"result_id": "r1", "target_albums": 2},
+                  verifier=self._FakeVerifier({("B", "fake"): "not_found"}))
+        fed_back = pipeline.select_discovery_albums.call_args_list[1].kwargs["previously_recommended"]
+        assert "B|||fake" in fed_back
+
+    def test_canonical_names_and_year_replace_the_models(self):
+        from backend.models import AlbumVerification
+        pipeline = self._pipeline([[self._album("Radiohead", "OK Computers")]])
+        v = self._FakeVerifier({("Radiohead", "OK Computers"): AlbumVerification(
+            status="verified", musicbrainz_id="b1392450-e666-3926-a536-22c65f834433",
+            artist="Radiohead", album="OK Computer", year=1997)})
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 1}, verifier=v)
+        a = data["albums"][0]
+        assert (a["album"], a["year"], a["musicbrainz_id"]) == (
+            "OK Computer", 1997, "b1392450-e666-3926-a536-22c65f834433")
+
+    def test_misspelled_owned_album_is_caught_after_canonicalisation(self):
+        """The exclusion list compares the model's spelling; this compares
+        MusicBrainz's, which is the one that matches the library."""
+        from backend.models import AlbumVerification, TasteProfile
+        pipeline = self._pipeline([[self._album("Beatles", "Abey Road"), self._album("X", "Y")], []])
+        pipeline.build_playlist_taste_profile.return_value = TasteProfile(
+            owned_albums=[{"artist": "The Beatles", "album": "Abbey Road (Remastered)"}])
+        v = self._FakeVerifier({("Beatles", "Abey Road"): AlbumVerification(
+            status="verified", musicbrainz_id="x", artist="The Beatles", album="Abbey Road", year=1969)})
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 2}, verifier=v)
+        assert [a["album"] for a in data["albums"]] == ["Y"]
+        assert data["rejected"][0]["reason"] == "owned"
+
+    def test_outage_keeps_albums_as_unverified_and_stops_checking(self):
+        """An outage is not evidence of invention: keep, flag, and stop paying
+        retry delays after two failures in a row."""
+        batches = [[self._album("A", "1"), self._album("B", "2"), self._album("C", "3"), self._album("D", "4")]]
+        pipeline = self._pipeline(batches)
+        v = self._FakeVerifier({("A", "1"): "unavailable", ("B", "2"): "unavailable"})
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 4}, verifier=v)
+        assert [a["album"] for a in data["albums"]] == ["1", "2", "3", "4"]
+        assert all(a["verified"] is False for a in data["albums"])
+        assert data["unverified"] == 4
+        assert data["rejected"] == []
+        assert len(v.calls) == 2, f"kept checking during an outage: {v.calls}"
+
+    def test_single_blip_does_not_stop_checking(self):
+        batches = [[self._album("A", "1"), self._album("B", "fake"), self._album("C", "3")], []]
+        pipeline = self._pipeline(batches)
+        v = self._FakeVerifier({("A", "1"): "unavailable", ("B", "fake"): "not_found"})
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 3}, verifier=v)
+        assert len(v.calls) == 3
+        assert [(a["album"], a["verified"]) for a in data["albums"]] == [("1", False), ("3", True)]
+
+    def test_capped_albums_are_not_looked_up(self):
+        """The cap is free; a lookup costs a second of rate limit."""
+        batches = [[self._album("A", "1"), self._album("A", "2"), self._album("B", "3")]]
+        pipeline = self._pipeline(batches)
+        v = self._FakeVerifier()
+        self._run(pipeline, {"result_id": "r1", "target_albums": 2, "max_albums_per_artist": 1}, verifier=v)
+        assert ("A", "2") not in v.calls
+
+    def test_artist_cap_counts_spelling_variants_as_one_artist(self):
+        batches = [[self._album("The Beatles", "Revolver"), self._album("Beatles", "Help!"), self._album("B", "3")]]
+        pipeline = self._pipeline(batches)
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 2, "max_albums_per_artist": 1})
+        assert [a["album"] for a in data["albums"]] == ["Revolver", "3"]
+
+    def test_saved_run_keeps_rejections(self):
+        saved = {"id": "e1", "created_at": "t", "snapshot": {
+            "albums": [], "rounds": 1, "cost": 0.01,
+            "rejected": [{"artist": "B", "album": "fake", "reason": "not_found"}], "unverified": 2}}
+        from backend.main import app
+        with patch("backend.main.library_cache.get_latest_extend_for_playlist", return_value=saved):
+            data = TestClient(app).get("/api/extend/latest/r1").json()
+        assert data["rejected"] == saved["snapshot"]["rejected"]
+        assert data["unverified"] == 2
+
+    def test_saved_run_from_before_verification_still_loads(self):
+        saved = {"id": "e1", "created_at": "t", "snapshot": {"albums": [], "rounds": 1, "cost": 0.0}}
+        from backend.main import app
+        with patch("backend.main.library_cache.get_latest_extend_for_playlist", return_value=saved):
+            data = TestClient(app).get("/api/extend/latest/r1").json()
+        assert (data["rejected"], data["unverified"]) == ([], 0)
 
     def _pipeline(self, batches):
         """A pipeline whose selector returns each batch in turn."""

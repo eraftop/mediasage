@@ -1762,6 +1762,10 @@ async def get_latest_extend(source_result_id: str) -> dict:
         "rounds": snapshot.get("rounds"),
         "cost": snapshot.get("cost"),
         "max_albums_per_artist": snapshot.get("max_albums_per_artist"),
+        # Absent on runs saved before verification existed; the UI treats
+        # absent as "nothing dropped", which is what those runs did.
+        "rejected": snapshot.get("rejected", []),
+        "unverified": snapshot.get("unverified", 0),
     }
 
 
@@ -2022,24 +2026,47 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
             detail="Library cache is empty. A full library is needed to know what is missing from it.",
         )
 
-    def event_stream():
+    async def event_stream():
+        from backend.music_research import album_keys, normalize_name
+
+        def sse(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
         try:
-            candidates_raw = library_cache.get_album_candidates()
+            candidates_raw = await asyncio.to_thread(library_cache.get_album_candidates)
             library_candidates = [AlbumCandidate(**c) for c in candidates_raw]
-            profile = pipeline.build_playlist_taste_profile(tracks, library_candidates)
+            profile = await asyncio.to_thread(
+                pipeline.build_playlist_taste_profile, tracks, library_candidates
+            )
             prompt = _playlist_extend_prompt(result, tracks)
             session_id = pipeline.create_session(
                 RecommendSessionState(mode="discovery", prompt=prompt, taste_profile=profile)
             )
 
+            # Owned albums under every title form, re-checked AFTER verification:
+            # the model may misspell an album you own, which slips past the
+            # exclusion list, and MusicBrainz's canonical spelling then catches it.
+            owned: set[tuple[str, str]] = set()
+            for a in profile.owned_albums:
+                owned |= album_keys(a.get("artist", ""), a.get("album", ""))
+
+            research_client = _get_research_client()
             found: list[AlbumRecommendation] = []
+            rejected: list[dict] = []
+            unverified = 0
             seen: set[str] = set()
             artist_counts: dict[str, int] = {}
+            # After this many lookups in a row come back `unavailable`, stop
+            # checking for the rest of the run rather than wait out every retry
+            # while MusicBrainz is down.
+            consecutive_unavailable = 0
+            checking = True
             rounds = 0
             while len(found) < request.target_albums and rounds < MAX_EXTEND_ROUNDS:
                 rounds += 1
-                yield f"event: progress\ndata: {json.dumps({'step': 'selecting', 'message': f'Looking for albums ({len(found)} of {request.target_albums} so far)...'})}\n\n"
-                batch = pipeline.select_discovery_albums(
+                yield sse("progress", {"step": "selecting", "message": f"Looking for albums ({len(found)} of {request.target_albums} so far)..."})
+                batch = await asyncio.to_thread(
+                    pipeline.select_discovery_albums,
                     prompt=prompt,
                     answers=[],
                     answer_texts=[],
@@ -2049,9 +2076,9 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                 )
                 # `fresh` counts albums the model had not offered before;
                 # `added` counts the ones actually kept. They differ when the
-                # per-artist cap rejects something new, and the early-stop guard
-                # below must key on `fresh`: a round that offered three new
-                # albums and had them all capped still taught us something (the
+                # per-artist cap or verification rejects something new, and the
+                # early-stop guard below must key on `fresh`: a round whose new
+                # albums were all rejected still taught the model something (the
                 # exclusion list grew), whereas a round that repeated itself did
                 # not and is worth stopping for.
                 fresh = 0
@@ -2062,14 +2089,48 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                         continue
                     seen.add(key)
                     fresh += 1
-                    artist_key = album.artist.strip().lower()
+                    # Cap checked before the lookup: a capped album costs nothing.
                     if (
                         request.max_albums_per_artist > 0
-                        and artist_counts.get(artist_key, 0) >= request.max_albums_per_artist
+                        and artist_counts.get(normalize_name(album.artist), 0) >= request.max_albums_per_artist
                     ):
                         # Rejected, but still fed back below so the model stops
                         # offering this artist and the loop can converge.
                         continue
+
+                    # EXISTENCE CHECK. Extend Library's picks come from the
+                    # model's memory alone, so a confident invented album is a
+                    # real failure mode; MusicBrainz is the referee.
+                    if checking:
+                        yield sse("progress", {"step": "verifying", "message": f"Checking {album.artist} \u2014 {album.album} in MusicBrainz..."})
+                        v = await research_client.verify_album(album.artist, album.album, album.year)
+                        if v.status == "verified":
+                            consecutive_unavailable = 0
+                            album.artist = v.artist or album.artist
+                            album.album = v.album or album.album
+                            album.year = v.year or album.year
+                            album.musicbrainz_id = v.musicbrainz_id
+                            album.verified = True
+                        elif v.status in ("not_found", "not_album"):
+                            consecutive_unavailable = 0
+                            rejected.append({"artist": album.artist, "album": album.album, "reason": v.status})
+                            continue
+                        else:
+                            consecutive_unavailable += 1
+                            album.verified = False
+                            if consecutive_unavailable >= 2:
+                                checking = False
+                                logger.warning("extend: MusicBrainz unavailable twice running; not checking the rest of this run")
+                    else:
+                        album.verified = False
+
+                    if album.verified and album_keys(album.artist, album.album) & owned:
+                        rejected.append({"artist": album.artist, "album": album.album, "reason": "owned"})
+                        continue
+                    if album.verified is False:
+                        unverified += 1
+
+                    artist_key = normalize_name(album.artist)
                     artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
                     found.append(album)
                     added += 1
@@ -2077,9 +2138,9 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                         break
                 pipeline.update_previously_recommended(session_id, sorted(seen))
                 logger.info(
-                    "extend: round %d offered %d new, kept %d (artist cap %d), %d/%d total",
+                    "extend: round %d offered %d new, kept %d (artist cap %d), %d/%d total, %d rejected so far",
                     rounds, fresh, added, request.max_albums_per_artist,
-                    len(found), request.target_albums,
+                    len(found), request.target_albums, len(rejected),
                 )
                 if fresh == 0:
                     # The model is repeating itself; stop paying for rounds that
@@ -2097,12 +2158,15 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
             albums_payload = [a.model_dump() for a in found]
             if found:
                 try:
-                    saved_id = library_cache.save_result(
+                    saved_id = await asyncio.to_thread(
+                        library_cache.save_result,
                         result_type=library_cache.EXTEND_RESULT_TYPE,
                         title=f"Missing albums for {result.get('title') or 'a playlist'}",
                         prompt=result.get("prompt") or "",
                         snapshot={
                             "albums": albums_payload,
+                            "rejected": rejected,
+                            "unverified": unverified,
                             "source_result_id": request.result_id,
                             "source_title": result.get("title") or "",
                             "target_albums": request.target_albums,
@@ -2117,10 +2181,13 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                     # A result the user can see is worth more than a stored one.
                     logger.exception("extend: saving the result failed; returning it anyway")
 
-            yield f"event: complete\ndata: {json.dumps({'albums': albums_payload, 'rounds': rounds, 'cost': cost, 'result_id': saved_id})}\n\n"
+            yield sse("complete", {
+                "albums": albums_payload, "rejected": rejected, "unverified": unverified,
+                "rounds": rounds, "cost": cost, "result_id": saved_id,
+            })
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error
             logger.exception("extend_library_sse failed")
-            yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
+            yield sse("error", {"message": str(exc)})
 
     return StreamingResponse(
         event_stream(),

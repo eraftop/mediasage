@@ -5867,23 +5867,54 @@ async function loadExtendPlaylists() {
     }
 }
 
-function renderExtendResults(albums, rounds, cost) {
+function renderExtendResults(albums, rounds, cost, rejected = [], unverified = 0) {
     const summary = document.getElementById('extend-summary');
     const list = document.getElementById('extend-results');
     if (summary) {
         const costText = cost ? ` \u00b7 $${cost.toFixed(4)}` : '';
-        summary.textContent = albums.length
+        let text = albums.length
             ? `${albums.length} album${albums.length === 1 ? '' : 's'} you do not own, in ${rounds} round${rounds === 1 ? '' : 's'}${costText}`
             : 'Nothing new found. Try a different playlist, or ask for fewer albums.';
+        const invented = rejected.filter(r => r.reason === 'not_found').length;
+        const owned = rejected.filter(r => r.reason === 'owned').length;
+        const singles = rejected.filter(r => r.reason === 'not_album').length;
+        const notes = [];
+        if (invented) notes.push(`${invented} suggestion${invented === 1 ? '' : 's'} dropped as not found in MusicBrainz`);
+        if (singles) notes.push(`${singles} dropped as a single, not an album`);
+        if (owned) notes.push(`${owned} dropped as already owned`);
+        if (unverified) notes.push(`${unverified} unverified: MusicBrainz was unreachable`);
+        if (notes.length) text += ` \u00b7 ${notes.join(' \u00b7 ')}`;
+        summary.textContent = text;
     }
     if (list) {
-        list.innerHTML = albums.map(a => `
+        // Everything here is model or MusicBrainz text: escape all of it.
+        const cards = albums.map(a => {
+            const title = `${escapeHtml(a.artist)} \u2014 ${escapeHtml(a.album)}${a.year ? ` (${a.year})` : ''}`;
+            const mbid = a.musicbrainz_id && /^[0-9a-f-]{36}$/.test(a.musicbrainz_id) ? a.musicbrainz_id : null;
+            const badge = a.verified === false
+                ? '<span class="extend-unverified" title="MusicBrainz could not be reached, so this album was not checked">unverified</span>'
+                : '';
+            const link = mbid
+                ? `<a class="extend-mb-link" href="https://musicbrainz.org/release-group/${mbid}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>`
+                : '';
+            return `
             <div class="result-card">
                 <div class="result-card-body">
-                    <h4>${a.artist} \u2014 ${a.album}${a.year ? ` (${a.year})` : ''}</h4>
-                    ${a.pitch && a.pitch.hook ? `<p>${a.pitch.hook}</p>` : ''}
+                    <h4>${title} ${badge}</h4>
+                    ${a.pitch && a.pitch.hook ? `<p>${escapeHtml(a.pitch.hook)}</p>` : ''}
+                    ${link}
                 </div>
-            </div>`).join('');
+            </div>`;
+        });
+        const dropped = rejected.filter(r => r.reason === 'not_found');
+        if (dropped.length) {
+            cards.push(`
+            <details class="extend-dropped">
+                <summary>Suggested but not found in MusicBrainz (${dropped.length})</summary>
+                <ul>${dropped.map(r => `<li>${escapeHtml(r.artist)} \u2014 ${escapeHtml(r.album)}</li>`).join('')}</ul>
+            </details>`);
+        }
+        list.innerHTML = cards.join('');
     }
 }
 
@@ -5937,7 +5968,7 @@ async function runExtend() {
                     progress.textContent = payload.message || 'Working...';
                 } else if (event === 'complete' && payload) {
                     state.extend.albums = payload.albums || [];
-                    renderExtendResults(state.extend.albums, payload.rounds, payload.cost);
+                    renderExtendResults(state.extend.albums, payload.rounds, payload.cost, payload.rejected || [], payload.unverified || 0);
                     setExtendStep('results');
                     refreshSpend();
                     done = true;
@@ -5981,7 +6012,7 @@ function initExtendLibrary() {
         const prev = state.extend.previous;
         if (!prev) return;
         state.extend.albums = prev.albums || [];
-        renderExtendResults(state.extend.albums, prev.rounds, prev.cost);
+        renderExtendResults(state.extend.albums, prev.rounds, prev.cost, prev.rejected || [], prev.unverified || 0);
         const summary = document.getElementById('extend-summary');
         if (summary) {
             summary.textContent = `${summary.textContent} \u00b7 saved ${prev.created_at}`;

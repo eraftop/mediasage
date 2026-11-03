@@ -3678,3 +3678,31 @@ body.no-scroll {
         padding: 0 var(--spacing-sm) var(--spacing-sm);
     }
 }
+
+/* Extend Library: MusicBrainz verification */
+.extend-unverified {
+    display: inline-block;
+    margin-left: var(--spacing-sm);
+    padding: 0 var(--spacing-sm);
+    font-size: 0.75em;
+    font-weight: normal;
+    border: 1px solid var(--text-secondary);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    vertical-align: middle;
+}
+
+.extend-mb-link {
+    font-size: 0.85em;
+    color: var(--accent);
+}
+
+.extend-dropped {
+    margin-top: var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: 0.9em;
+}
+
+.extend-dropped summary {
+    cursor: pointer;
+}

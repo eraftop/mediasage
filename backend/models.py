@@ -664,6 +664,28 @@ class AlbumRecommendation(BaseModel):
     art_url: str | None = None
     pitch: SommelierPitch = SommelierPitch()
     research_available: bool = False
+    # Set only by Extend Library, which checks every suggestion against
+    # MusicBrainz. None = never checked (the Recommended Albums tab), True = a
+    # matching release group was found, False = MusicBrainz was unreachable so
+    # the album is shown but unconfirmed.
+    musicbrainz_id: str | None = None
+    verified: bool | None = None
+
+
+class AlbumVerification(BaseModel):
+    """Outcome of checking that a suggested album really exists.
+
+    `unavailable` is deliberately distinct from `not_found`: an outage must not
+    be read as proof that every suggestion was invented.
+    """
+
+    # not_album: the artist really has a release by that title, but MusicBrainz
+    # files it as a single (or similar), so it is real yet not an album.
+    status: Literal["verified", "not_found", "not_album", "unavailable"]
+    musicbrainz_id: str | None = None
+    artist: str | None = None  # canonical spelling, from MusicBrainz
+    album: str | None = None
+    year: int | None = None
 
 
 class ResearchData(BaseModel):
