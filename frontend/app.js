@@ -5849,7 +5849,7 @@ async function loadExtendPlaylists() {
     try {
         // Reuses the existing results endpoint; only playlist-type results carry
         // the track snapshot this feature learns from.
-        const res = await fetch('/api/results?result_type=prompt_playlist,seed_playlist&limit=50');
+        const res = await fetch('/api/results?type=prompt_playlist,seed_playlist&limit=50');
         const data = await res.json();
         state.extend.playlists = data.results || [];
         select.innerHTML = state.extend.playlists
