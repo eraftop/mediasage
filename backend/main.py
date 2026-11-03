@@ -1978,7 +1978,17 @@ async def serve_index():
     return {"message": "MediaSage API is running. Frontend not found."}
 
 # Albums one would want for a given playlist, that the library does not have.
-MAX_EXTEND_ROUNDS = 6
+# Albums asked for per model call. Each call re-sends the owned-album list (up
+# to 2,500 albums), so fewer, larger calls are much cheaper than many small ones.
+EXTEND_PER_ROUND = 10
+# Rounds beyond the minimum, to absorb what the artist cap and MusicBrainz drop.
+# Was a flat 6 rounds of 3 -- at most 18 albums, so a target of 20 could never
+# be met (reported 2026-11-03: asked for 20, got 7).
+EXTEND_SPARE_ROUNDS = 3
+
+
+def _extend_round_budget(target: int) -> int:
+    return -(-target // EXTEND_PER_ROUND) + EXTEND_SPARE_ROUNDS
 
 
 def _playlist_extend_prompt(result: dict, tracks: list[dict]) -> str:
@@ -2062,7 +2072,10 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
             consecutive_unavailable = 0
             checking = True
             rounds = 0
-            while len(found) < request.target_albums and rounds < MAX_EXTEND_ROUNDS:
+            # Display names of artists the cap has filled, fed to the model.
+            full_artists: dict[str, str] = {}
+            max_rounds = _extend_round_budget(request.target_albums)
+            while len(found) < request.target_albums and rounds < max_rounds:
                 rounds += 1
                 yield sse("progress", {"step": "selecting", "message": f"Looking for albums ({len(found)} of {request.target_albums} so far)..."})
                 batch = await asyncio.to_thread(
@@ -2073,6 +2086,8 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                     taste_profile=profile,
                     session_id=session_id,
                     previously_recommended=sorted(seen) or None,
+                    max_results=EXTEND_PER_ROUND,
+                    avoid_artists=sorted(full_artists.values()) or None,
                 )
                 # `fresh` counts albums the model had not offered before;
                 # `added` counts the ones actually kept. They differ when the
@@ -2083,6 +2098,7 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                 # not and is worth stopping for.
                 fresh = 0
                 added = 0
+                capped = 0
                 for album in batch:
                     key = f"{album.artist}|||{album.album}"
                     if key in seen:
@@ -2096,6 +2112,7 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
                     ):
                         # Rejected, but still fed back below so the model stops
                         # offering this artist and the loop can converge.
+                        capped += 1
                         continue
 
                     # EXISTENCE CHECK. Extend Library's picks come from the
@@ -2132,14 +2149,16 @@ async def extend_library_sse(request: ExtendLibraryRequest) -> StreamingResponse
 
                     artist_key = normalize_name(album.artist)
                     artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+                    if 0 < request.max_albums_per_artist <= artist_counts[artist_key]:
+                        full_artists[artist_key] = album.artist
                     found.append(album)
                     added += 1
                     if len(found) >= request.target_albums:
                         break
                 pipeline.update_previously_recommended(session_id, sorted(seen))
                 logger.info(
-                    "extend: round %d offered %d new, kept %d (artist cap %d), %d/%d total, %d rejected so far",
-                    rounds, fresh, added, request.max_albums_per_artist,
+                    "extend: round %d/%d offered %d new, kept %d, capped %d (cap %d), %d/%d total, %d rejected so far",
+                    rounds, max_rounds, fresh, added, capped, request.max_albums_per_artist,
                     len(found), request.target_albums, len(rejected),
                 )
                 if fresh == 0:

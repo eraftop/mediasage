@@ -722,6 +722,46 @@ class TestExtendLibrary:
         _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 2, "max_albums_per_artist": 1})
         assert [a["album"] for a in data["albums"]] == ["Revolver", "3"]
 
+    def test_twenty_is_reachable(self):
+        """Reported 2026-11-03: asked for 20, got 7. Six rounds of three could
+        never exceed 18; batches of ten within the round budget can."""
+        batches = [[self._album(f"Artist {r}-{i}", f"A{r}-{i}") for i in range(10)] for r in range(3)]
+        pipeline = self._pipeline(batches)
+        _, data = self._run(pipeline, {"result_id": "r1", "target_albums": 20})
+        assert len(data["albums"]) == 20
+        assert data["rounds"] == 2
+
+    def test_extend_asks_for_full_batches(self):
+        from backend.main import EXTEND_PER_ROUND
+        pipeline = self._pipeline([[self._album("A", "1")], []])
+        self._run(pipeline, {"result_id": "r1", "target_albums": 5})
+        assert pipeline.select_discovery_albums.call_args.kwargs["max_results"] == EXTEND_PER_ROUND
+
+    def test_capped_artists_are_named_to_the_model(self):
+        """Otherwise it keeps offering another record by a band already listed
+        (9 of 18 suggestions were capped away on 2026-11-03)."""
+        batches = [
+            [self._album("Opeth", "Blackwater Park"), self._album("Katatonia", "Brave Murder Day")],
+            [self._album("Anathema", "Alternative 4")],
+        ]
+        pipeline = self._pipeline(batches)
+        self._run(pipeline, {"result_id": "r1", "target_albums": 3, "max_albums_per_artist": 1})
+        calls = pipeline.select_discovery_albums.call_args_list
+        assert calls[0].kwargs["avoid_artists"] is None
+        assert calls[1].kwargs["avoid_artists"] == ["Katatonia", "Opeth"]
+
+    def test_no_cap_means_no_artists_are_avoided(self):
+        batches = [[self._album("Opeth", "Blackwater Park")], [self._album("Opeth", "Damnation")], []]
+        pipeline = self._pipeline(batches)
+        self._run(pipeline, {"result_id": "r1", "target_albums": 3, "max_albums_per_artist": 0})
+        assert all(c.kwargs["avoid_artists"] is None for c in pipeline.select_discovery_albums.call_args_list)
+
+    def test_round_budget_scales_with_the_target(self):
+        from backend.main import _extend_round_budget
+        assert _extend_round_budget(5) == 4
+        assert _extend_round_budget(20) == 5
+        assert _extend_round_budget(30) == 6
+
     def test_saved_run_keeps_rejections(self):
         saved = {"id": "e1", "created_at": "t", "snapshot": {
             "albums": [], "rounds": 1, "cost": 0.01,

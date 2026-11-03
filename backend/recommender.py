@@ -1043,12 +1043,23 @@ class RecommendationPipeline:
         session_id: str,
         previously_recommended: list[str] | None = None,
         max_exclusion_albums: int = 2500,
+        max_results: int = 3,
+        avoid_artists: list[str] | None = None,
     ) -> list[AlbumRecommendation]:
         """Select 1 primary + 2 secondary albums NOT in the user's library.
 
         Uses taste profile as context and owned_albums as exclusion list.
         Returns list of AlbumRecommendation (without pitches or rating_keys).
+
+        `max_results` and `avoid_artists` exist for Extend Library and default
+        to the Recommended Albums behaviour. That tab shows 3, so it asks for 7
+        and keeps 3; Extend wants every album a call produces, because each
+        call re-sends the whole owned-album list and is the expensive part.
+        `avoid_artists` names artists Extend's per-artist cap has filled --
+        without it the model keeps offering another record by a band already
+        listed, and the cap throws it away (9 of 18 suggestions on 2026-11-03).
         """
+        ask_for = max(7, max_results)
         # Build taste summary
         top_genres = sorted(taste_profile.genre_distribution, key=taste_profile.genre_distribution.get, reverse=True)[:10]
         top_decades = sorted(taste_profile.decade_distribution, key=taste_profile.decade_distribution.get, reverse=True)[:5]
@@ -1073,11 +1084,11 @@ class RecommendationPipeline:
 
         system = (
             "You are a music recommendation expert with encyclopedic knowledge. "
-            "Recommend 7 albums the user does NOT already own that match their request and taste profile. "
+            f"Recommend {ask_for} albums the user does NOT already own that match their request and taste profile. "
             "The first pick is the PRIMARY recommendation (best match), the others are SECONDARY.\n\n"
             "IMPORTANT: Do NOT recommend any album from the exclusion list below. "
             "Recommend real, existing albums with correct artist names and years.\n\n"
-            "Return a JSON array of 5 objects, each with: artist (string), album (string), "
+            f"Return a JSON array of {ask_for} objects, each with: artist (string), album (string), "
             "year (integer), rank (\"primary\" for first, \"secondary\" for others).\n"
             "No explanation, just the JSON array."
         )
@@ -1092,6 +1103,11 @@ class RecommendationPipeline:
                     prev_lines.append(f"- {parts[0]} — {parts[1]}")
             if prev_lines:
                 prev_text = "\n\nAlready recommended (DO NOT repeat these):\n" + "\n".join(prev_lines)
+        if avoid_artists:
+            prev_text += (
+                "\n\nArtists already covered -- do NOT recommend ANY album by these:\n"
+                + "\n".join(f"- {a}" for a in avoid_artists)
+            )
 
         user_prompt = (
             f"User wants: \"{prompt}\"\n\n"
@@ -1099,7 +1115,7 @@ class RecommendationPipeline:
             f"User's taste profile:\n{taste_text}\n\n"
             f"Albums user already owns (DO NOT recommend these):\n{exclusion_text}"
             f"{prev_text}\n\n"
-            f"Recommend 7 albums they don't own: 1 primary + 6 secondary."
+            f"Recommend {ask_for} albums they don't own: 1 primary + {ask_for - 1} secondary."
         )
 
         response = self.llm_client.analyze(user_prompt, system)
@@ -1115,8 +1131,8 @@ class RecommendationPipeline:
             for a in taste_profile.owned_albums
         }
 
-        for item in raw[:7]:
-            if len(recommendations) >= 3:
+        for item in raw[:ask_for]:
+            if len(recommendations) >= max_results:
                 break
             # Skip albums the user already owns
             rec_key = album_key(item.get("artist", ""), item.get("album", ""))

@@ -810,3 +810,57 @@ class TestPlaylistTasteProfile:
         assert profile.genre_distribution == {}
         assert len(profile.owned_albums) == 3
 
+
+
+class TestDiscoverySelectionForExtend:
+    """select_discovery_albums gained max_results and avoid_artists for Extend
+    Library. The Recommended Albums tab calls it with neither and must see no
+    change: 3 albums, from a request for 7."""
+
+    @staticmethod
+    def _pipeline(n_returned):
+        from backend.recommender import RecommendationPipeline
+        llm = MagicMock()
+        llm.analyze.return_value = MagicMock()
+        llm.parse_json_response.return_value = [
+            {"artist": f"Artist {i}", "album": f"Album {i}", "year": 2000, "rank": "secondary"}
+            for i in range(n_returned)
+        ]
+        p = RecommendationPipeline(config=MagicMock(), llm_client=llm)
+        p._log_cost = MagicMock()
+        return p, llm
+
+    @staticmethod
+    def _call(p, **kw):
+        from backend.models import TasteProfile
+        return p.select_discovery_albums(
+            prompt="x", answers=[], answer_texts=[], taste_profile=TasteProfile(),
+            session_id="s", **kw)
+
+    @staticmethod
+    def _prompt(llm):
+        args, kwargs = llm.analyze.call_args
+        return (args[0] if args else kwargs.get("prompt", "")), (args[1] if len(args) > 1 else kwargs.get("system", ""))
+
+    def test_default_is_unchanged_for_recommended_albums(self):
+        p, llm = self._pipeline(7)
+        assert len(self._call(p)) == 3
+        user, system = self._prompt(llm)
+        assert "Recommend 7 albums" in system and "1 primary + 6 secondary" in user
+        assert "Artists already covered" not in user
+
+    def test_extend_keeps_every_album_it_asked_for(self):
+        p, llm = self._pipeline(10)
+        recs = self._call(p, max_results=10)
+        assert len(recs) == 10
+        user, system = self._prompt(llm)
+        assert "Recommend 10 albums" in system
+        assert "JSON array of 10 objects" in system
+        assert "1 primary + 9 secondary" in user
+
+    def test_avoid_artists_reach_the_prompt(self):
+        p, llm = self._pipeline(3)
+        self._call(p, avoid_artists=["Opeth", "Katatonia"])
+        user, _ = self._prompt(llm)
+        assert "do NOT recommend ANY album by these" in user
+        assert "- Opeth" in user and "- Katatonia" in user
